@@ -186,7 +186,7 @@
 
 # 儀表板截圖
 
-# 請在此處替換成您自己的儀表板運行截圖
+#<img width="2286" height="1611" alt="dashboard-screenshot" src="https://github.com/user-attachments/assets/5c03d1e3-0e94-438a-852e-074038fe5f6a" />
 
 # 
 
