@@ -186,7 +186,7 @@
 
 # 儀表板截圖
 
-#<img width="2286" height="1611" alt="dashboard-screenshot" src="https://github.com/user-attachments/assets/5c03d1e3-0e94-438a-852e-074038fe5f6a" />
+<img width="2286" height="1611" alt="dashboard-screenshot" src="https://github.com/user-attachments/assets/5c03d1e3-0e94-438a-852e-074038fe5f6a" />
 
 # 
 
