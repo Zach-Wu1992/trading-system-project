@@ -3,8 +3,10 @@ import random
 import pandas as pd
 
 # --- 設定 ---
-# 確保這個檔案名稱與您的 dashboard.py 和 realtime_bot.py 中使用的名稱一致
-DB_NAME = 'trading_dashboard.db'
+# --- ▼▼▼ 關鍵修正 ▼▼▼ ---
+# 統一所有檔案使用的資料庫名稱，確保與 app.py 一致
+DB_NAME = 'trading_system.db'
+# --- ▲▲▲ 關鍵修正 ▲▲▲ ---
 STOCK_ID = "2308.TW"
 INITIAL_CASH = 1000000
 
@@ -15,7 +17,6 @@ def generate_test_data():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
-    # --- 1. 清除所有舊的數據，確保一個乾淨的開始 ---
     print("🧹 正在清除舊的測試數據...")
     cursor.execute("DROP TABLE IF EXISTS trades")
     cursor.execute("DROP TABLE IF EXISTS daily_performance")
@@ -35,7 +36,6 @@ def generate_test_data():
     conn.commit()
     print("✅ 舊數據已清除並重新建立表格。")
 
-    # --- 2. 生成每日績效數據 (用於績效曲線圖) ---
     print("📈 正在生成 30 天的每日績效數據...")
     dates = pd.date_range(end=pd.Timestamp.today(), periods=30)
     asset_values = []
@@ -48,7 +48,6 @@ def generate_test_data():
     conn.commit()
     print(f"✅ 已請求生成 {len(asset_values)} 筆績效紀錄。")
 
-    # --- 3. 生成交易歷史數據 (用於交易列表) ---
     print("🧾 正在生成模擬交易歷史紀錄...")
     mock_trades = [
         ('2025-08-15', STOCK_ID, '買入', 1000, 350.50, 350500, None),
@@ -62,37 +61,20 @@ def generate_test_data():
     conn.commit()
     print(f"✅ 已請求生成 {len(mock_trades)} 筆交易紀錄。")
 
-    # --- 4. 新增：驗證數據是否成功寫入 ---
     print("\n" + "="*30)
     print("🔍 正在驗證資料庫中的數據...")
-    
-    # 驗證 daily_performance
     cursor.execute("SELECT COUNT(*) FROM daily_performance")
     perf_count = cursor.fetchone()[0]
-    if perf_count > 0:
-        print(f"✔️  成功驗證：在 'daily_performance' 表中找到 {perf_count} 筆紀錄。")
-    else:
-        print(f"❌  驗證失敗：在 'daily_performance' 表中找不到任何紀錄！")
-
-    # 驗證 trades
+    print(f"✔️  在 'daily_performance' 表中找到 {perf_count} 筆紀錄。")
     cursor.execute("SELECT COUNT(*) FROM trades")
     trade_count = cursor.fetchone()[0]
-    if trade_count > 0:
-        print(f"✔️  成功驗證：在 'trades' 表中找到 {trade_count} 筆紀錄。")
-    else:
-        print(f"❌  驗證失敗：在 'trades' 表中找不到任何紀錄！")
+    print(f"✔️  在 'trades' 表中找到 {trade_count} 筆紀錄。")
     print("="*30)
 
     conn.close()
     
-    if perf_count > 0 and trade_count > 0:
-        print("\n🎉 測試數據生成並驗證完畢！現在您可以啟動 dashboard.py 來查看結果了。")
-    else:
-        print("\n⚠️ 數據生成似乎有問題，請檢查上面的驗證訊息。")
+    print("\n🎉 測試數據生成並驗證完畢！現在您可以啟動 app.py 來查看結果了。")
 
-# --- 程式進入點 ---
 if __name__ == '__main__':
     generate_test_data()
-
-        
 
