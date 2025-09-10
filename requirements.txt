@@ -1,6 +1,6 @@
 Flask==3.0.3
 gunicorn==22.0.0
-pandas==1.5.3
+pandas==2.3.2
 pandas-ta==0.4.67b0
 FinMind==1.6.5
 psycopg2-binary==2.9.9
