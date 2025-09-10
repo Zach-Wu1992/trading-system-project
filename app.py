@@ -11,10 +11,8 @@ from psycopg2.extras import RealDictCursor # <--- 讓查詢結果像字典
 from flask import Flask, render_template_string, request, jsonify
 
 # --- 1. 全域設定與參數 ---
-# --- ▼▼▼ 改為從環境變數讀取 ▼▼▼ ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
 API_SECRET_KEY = os.environ.get('API_SECRET_KEY', "my_super_secret_key_123_for_local_dev")
-# --- ▲▲▲ 改為從環境變數讀取 ▲▲▲ ---
 
 pd.set_option('display.max_columns', None)
 CASH = 1000000
@@ -24,16 +22,12 @@ STOP_LOSS_PCT = 0.02
 
 # --- 2. 核心資料庫函式 (升級為 PostgreSQL) ---
 def get_db_connection():
-    """建立 PostgreSQL 連線"""
     if not DATABASE_URL:
-        # 在本地開發時，如果沒有設定環境變數，可以提供一個備用的本地連線字串
-        # 但為了 Render 部署，我們假設 DATABASE_URL 一定會存在
         raise ValueError("DATABASE_URL 環境變數未設定！")
     conn = psycopg2.connect(DATABASE_URL)
     return conn
 
 def setup_database():
-    """建立資料庫和資料表"""
     print("🚀 正在設定 PostgreSQL 資料庫...")
     conn = get_db_connection()
     try:
@@ -57,7 +51,6 @@ def setup_database():
                     key TEXT PRIMARY KEY, value TEXT NOT NULL
                 )
             ''')
-            # ON CONFLICT...DO NOTHING 適用於 PostgreSQL
             cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING", ('live_stock_id', '2308.TW'))
         conn.commit()
         print("✅ 資料庫設定完成。")
@@ -81,7 +74,6 @@ def update_setting(key, value):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # ON CONFLICT...DO UPDATE 適用於 PostgreSQL
             cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, value))
         conn.commit()
     finally:
@@ -139,39 +131,29 @@ def get_current_portfolio(stock_id):
         conn.close()
 
 def execute_trade(timestamp, signal, price, portfolio, stock_id):
-    # (此函式邏輯不變，它呼叫的 log_trade 已經被更新)
     if signal == "買入":
         log_trade(timestamp, stock_id, "買入訊號", 0, price)
-        if portfolio['position'] < MAX_POSITION_SHARES and \
-           (portfolio['position'] == 0 or price > portfolio['avg_cost']) and \
-           portfolio['cash'] >= price * ADD_ON_SHARES:
+        if portfolio['position'] < MAX_POSITION_SHARES and (portfolio['position'] == 0 or price > portfolio['avg_cost']) and portfolio['cash'] >= price * ADD_ON_SHARES:
             log_trade(timestamp, stock_id, "執行買入", ADD_ON_SHARES, price)
-            print(f"📈【執行買入】時間 {timestamp.strftime('%Y-%m-%d %H:%M')}，價格 {price:.2f}")
-
     elif signal == "賣出":
         log_trade(timestamp, stock_id, "賣出訊號", 0, price)
         if portfolio['position'] > 0:
             shares_to_sell = portfolio['position']
             profit = (price - portfolio['avg_cost']) * shares_to_sell
             log_trade(timestamp, stock_id, "執行賣出", shares_to_sell, price, profit)
-            print(f"📉【執行賣出】時間 {timestamp.strftime('%Y-%m-%d %H:%M')}，損益：{profit:,.2f}")
-            
     elif signal == "持有":
         log_trade(timestamp, stock_id, "持有", 0, price)
 
 def check_stop_loss(timestamp, price, portfolio, stock_id):
-    # (此函式邏輯不變)
     if portfolio['position'] > 0:
         stop_loss_price = portfolio['avg_cost'] * (1 - STOP_LOSS_PCT)
         if price < stop_loss_price:
             shares_to_sell = portfolio['position']
             profit = (price - portfolio['avg_cost']) * shares_to_sell
             log_trade(timestamp, stock_id, "停損賣出", shares_to_sell, price, profit)
-            print(f"💥【強制停損】時間 {timestamp.strftime('%Y-%m-%d %H:%M')}!")
             return True
     return False
-    
-# (其他輔助函式 clean_df, calculate_latest_signal, get_latest_price_and_signal 保持不變)
+
 def clean_df(df_raw):
     if df_raw is None or df_raw.empty: return None
     df = df_raw.copy()
@@ -211,36 +193,25 @@ def get_latest_price_and_signal(stock_id):
     signal = calculate_latest_signal(df_daily)
     return latest_price, latest_time, signal
 
-# (run_trading_job 函式邏輯不變)
 def run_trading_job():
     stock_id = get_setting('live_stock_id') or "2308.TW"
-    print(f"\n🤖 [{pd.Timestamp.now(tz='Asia/Taipei').strftime('%Y-%m-%d %H:%M:%S')}] API被觸發，開始檢查 {stock_id}...")
     try:
         latest_price, latest_time, signal = get_latest_price_and_signal(stock_id)
         if latest_price is None: return {"status": "error", "message": "無法獲取最新價格資料"}
         if "失敗" in signal or "異常" in signal: return {"status": "error", "message": signal}
-        
         portfolio = get_current_portfolio(stock_id)
-        
         stop_loss_triggered = check_stop_loss(latest_time, latest_price, portfolio, stock_id)
         if not stop_loss_triggered:
             execute_trade(latest_time, signal, latest_price, portfolio, stock_id)
-        
         final_portfolio = get_current_portfolio(stock_id)
         total_asset = final_portfolio['cash'] + (final_portfolio['position'] * latest_price)
         log_performance(latest_time.date(), stock_id, total_asset)
-        
         message = f"檢查完成。總資產: {total_asset:,.2f}"
         return {"status": "success", "message": message}
     except Exception as e:
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
 
-# --- 4. Flask Web 應用 ---
-app = Flask(__name__)
-app.config['TEMPLATES_AUTO_RELOAD'] = True
-
-# (HTML_TEMPLATE 保持不變，此處省略)
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-Hant">
@@ -410,45 +381,57 @@ HTML_TEMPLATE = """
 """
 
 # --- 5. Flask 路由與邏輯 ---
-# (此處的 Flask 路由與邏輯與您上一版完全相同，保持不變)
+def get_live_dashboard_data():
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            stock_id = get_setting('live_stock_id')
+            stock_specific_cash_key = f"initial_cash_{stock_id}"
+            initial_cash = get_setting(stock_specific_cash_key) or CASH
+
+            cur.execute("SELECT * FROM trades WHERE stock_id = %s ORDER BY timestamp DESC", (stock_id,))
+            trades = cur.fetchall()
+            cur.execute("SELECT * FROM daily_performance WHERE stock_id = %s ORDER BY date ASC", (stock_id,))
+            performance = cur.fetchall()
+
+            latest_price, latest_signal = "N/A", "N/A"
+            try:
+                latest_price, _, latest_signal = get_latest_price_and_signal(stock_id)
+                if latest_price is None: latest_price = "N/A"
+                if latest_signal is None: latest_signal = "N/A"
+            except Exception as e:
+                print(f"❌ 獲取儀表板即時數據時發生錯誤: {e}")
+
+            if performance:
+                total_asset = performance[-1]['asset_value']
+            else:
+                current_portfolio = get_current_portfolio(stock_id)
+                total_asset = current_portfolio['cash']
+            
+            return {
+                "chart_data": {'dates': [p['date'] for p in performance], 'values': [p['asset_value'] for p in performance]},
+                "trades": trades,
+                "latest_price": latest_price,
+                "latest_signal": latest_signal,
+                "total_asset": total_asset,
+                "stock_id": stock_id, 
+                "initial_cash": initial_cash
+            }
+    finally:
+        conn.close()
+
+
 @app.route('/')
 def dashboard():
-    if not os.path.exists(DB_NAME):
-        conn = sqlite3.connect(DB_NAME)
-        setup_database(conn)
-        conn.close()
     live_data = get_live_dashboard_data()
     return render_template_string(HTML_TEMPLATE, live_data=live_data, api_secret_key=API_SECRET_KEY)
-
-def get_live_dashboard_data():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    stock_id = get_setting(conn, 'live_stock_id')
-    stock_specific_cash_key = f"initial_cash_{stock_id}"
-    initial_cash = get_setting(conn, stock_specific_cash_key) or CASH
-    trades_df = pd.read_sql_query(f"SELECT * FROM trades WHERE stock_id = ? ORDER BY timestamp DESC", conn, params=(stock_id,))
-    performance_df = pd.read_sql_query(f"SELECT * FROM daily_performance WHERE stock_id = ? ORDER BY date ASC", conn, params=(stock_id,))
-    latest_price, latest_signal = "N/A", "N/A"
-    try:
-        latest_price, _, latest_signal = get_latest_price_and_signal(stock_id)
-        if latest_price is None: latest_price = "N/A"
-        if latest_signal is None: latest_signal = "N/A"
-    except Exception as e:
-        print(f"❌ 獲取儀表板即時數據時發生錯誤: {e}")
-    if not performance_df.empty:
-        total_asset = performance_df['asset_value'].iloc[-1]
-    else:
-        current_portfolio = get_current_portfolio(conn, stock_id)
-        total_asset = current_portfolio['cash']
-    conn.close()
-    return {"chart_data": {'dates': performance_df['date'].tolist(),'values': performance_df['asset_value'].tolist()},"trades": trades_df.to_dict('records'),"latest_price": latest_price,"latest_signal": latest_signal,"total_asset": total_asset,"stock_id": stock_id, "initial_cash": initial_cash}
 
 @app.route('/api/trigger-trade-check', methods=['POST'])
 def trigger_trade_check():
     auth_header = request.headers.get('Authorization')
     if auth_header != f"Bearer {API_SECRET_KEY}": return jsonify({"status": "error", "message": "未經授權"}), 401
     result = run_trading_job()
-    if result['status'] == 'success': return jsonify(result), 200
+    if result.get('status') == 'success': return jsonify(result), 200
     else: return jsonify(result), 500
 
 @app.route('/api/run-backtest', methods=['POST'])
@@ -515,19 +498,23 @@ def update_settings_api():
         db_key = f"initial_cash_{stock_id}"
     else:
         db_key = key
-    conn = sqlite3.connect(DB_NAME)
+    
     try:
-        update_setting(conn, db_key, value)
+        update_setting(db_key, value)
         return jsonify({"status": "success", "message": f"設定 {db_key} 已更新為 {value}"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
-    finally:
-        conn.close()
 
 # --- 6. 程式主進入點 ---
 if __name__ == '__main__':
-    conn = sqlite3.connect(DB_NAME)
-    setup_database(conn)
-    conn.close()
+    # 第一次啟動時，初始化資料庫
+    # 這個判斷式可以避免在 Render 每次重啟時都執行
+    if not os.environ.get('RENDER'):
+        setup_database()
     app.run(host='0.0.0.0', port=5001, debug=True)
+
+def create_app():
+    # 這個函式是給 Gunicorn 用的
+    setup_database()
+    return app
 

@@ -1,35 +1,27 @@
-互動式證券自動交易分析平台
-一個整合了即時模擬交易儀表板與互動式歷史回測功能的 Python Flask Web 應用，由 n8n 工作流引擎驅動。
+證券自動交易分析平台 (雲端部署版)
+一個整合了即時模擬交易儀表板與互動式歷史回測功能的 Python Flask Web 應用，由 n8n.cloud 工作流引擎驅動，並部署在 Render 雲端平台上，使用 PostgreSQL 作為資料庫。
 
-這是一個專為 IT 職位面試設計的完整專案，旨在展示一個現代化的、服務分離的後端系統設計與互動式前端的開發流程。使用者不僅可以查看由 n8n 自動觸發的即時模擬交易績效，還可以自訂監控標的、初始資金，並在前端執行參數化的歷史回測。
+這是一個專為 IT 職位面試設計的完整專案，旨在展示一個現代化的、服務分離的後端系統設計與互動式前端的開發流程。
 
 專案預覽
-(請將此處的連結替換為您自己上傳到 GitHub 的最新儀表板截圖，記得要展示出新的設定區塊！)
+(請將此處的連結替換為您自己上傳到 GitHub 的最新儀表板截圖)
 
 系統架構
-本專案的核心是一個 Flask Web 應用，它同時扮演API 伺服器和前端渲染引擎的角色，並由 n8n 進行自動化觸發。
+本專案採用服務分離的現代雲端架構：
 
-n8n 工作流 (指揮官): 定時（例如：交易日的 9-13 點，每小時一次）向 Flask 應用發送 POST 請求，觸發每日的交易檢查。
+n8n.cloud (指揮官): 使用 n8n 官方的雲端服務，定時向部署在 Render 上的 Flask 應用發送 Webhook 請求。
 
-Flask 應用 (app.py):
+Render Web Service (士兵 + 資訊官):
 
-API 端點:
+一個運行 gunicorn 的 Python 環境，託管我們的 app.py。
 
-/api/trigger-trade-check: 接收 n8n 命令，執行即時交易模擬，並將結果存入資料庫。
+提供 API 端點接收 n8n 命令，並執行交易邏輯。
 
-/api/run-backtest: 接收使用者從前端發來的請求，執行歷史回測運算，並將結果回傳給前端。
+提供前端儀表板供使用者互動。
 
-/api/settings: 接收前端請求，更新資料庫中的使用者設定（如監控標的、初始資金）。
+Render PostgreSQL (軍火庫):
 
-前端介面 (/):
-
-提供一個單頁應用介面，包含兩個模式：
-
-即時儀表板: 顯示由 n8n 驅動的最新交易績效與紀錄，並提供可互動的設定面板。
-
-歷史回測: 提供表單讓使用者自訂回測參數（標的、日期、資金），並動態顯示回測結果。
-
-SQLite 資料庫: 作為永久儲存中心，記錄即時交易的歷史、績效數據以及使用者設定。
+一個由 Render 提供的全託管 PostgreSQL 資料庫，用於永久儲存所有交易、績效與設定數據。
 
 主要功能
 📊 整合性前端介面:
@@ -50,89 +42,74 @@ SQLite 資料庫: 作為永久儲存中心，記錄即時交易的歷史、績�
 
 🚀 n8n 工作流整合: 將排程功能外部化，由 n8n 負責觸發，使系統更具彈性與擴充性。
 
-📝 持久化設定: 所有使用者設定都會被儲存在資料庫中，重啟後依然保留。
-
-(交易策略、風控、分頁等功能與前一版相同)
+📝 持久化設定: 所有使用者設定都會被儲存在雲端 PostgreSQL 資料庫中，重啟後依然保留。
 
 技術棧 (Technology Stack)
-後端: Python, Flask
+後端: Python, Flask, Gunicorn
 
 數據處理: Pandas, pandas-ta
 
 資料獲取: yfinance
 
-資料庫: SQLite3
+資料庫: PostgreSQL (on Render)
 
-自動化: n8n (透過 Node.js/NPM 運行)
+自動化: n8n.cloud
 
 前端: HTML, Tailwind CSS, Chart.js, AJAX (fetch API)
 
 版本控制: Git, GitHub
 
-安裝與設定
-1. 環境準備
-Clone 專案:
+部署: Render
 
-git clone [https://github.com/](https://github.com/)[YourUsername]/[YourProjectName].git
-cd [YourProjectName]
+如何在雲端部署
+第一部分：部署 Flask 應用到 Render
+準備 GitHub: 將專案（包含最新的 app.py, requirements.txt, build.sh）推送到您的 GitHub 倉庫。
 
-建立 Conda 虛擬環境:
+註冊 Render: 前往 Render.com 並用您的 GitHub 帳號註冊。
 
-conda create --name trading_env python=3.9
-conda activate trading_env
+建立 PostgreSQL 資料庫:
 
-2. 安裝 Python 依賴
-使用專案提供的 requirements.txt 檔案進行安裝：
+在 Render 儀表板，點擊 New + -> PostgreSQL。
 
-pip install -r requirements.txt
+取一個名字（例如 trading-db），選擇離您最近的區域，點擊 Create Database。
 
-3. 安裝與設定 n8n (使用 Node.js/NPM)
-安裝 Node.js: 前往 Node.js 官方網站 下載並安裝 LTS 版本。
+建立後，往下滾動到 Connections 區塊，複製 Internal Database URL，我們稍後會用到。
 
-安裝 n8n: 開啟一個新的終端機，執行以下指令進行全域安裝：
+建立 Web Service:
 
-npm install n8n -g
+點擊 New + -> Web Service。
 
-如何運行與測試
-測試模式 (建議初次使用)
-產生測試數據: 在終端機中執行測試數據生成器，這會建立一個乾淨的資料庫並填入假資料。
+選擇您專案的 GitHub 倉庫並連接。
 
-python test_data_generator.py
+Name: trading-platform (或您喜歡的名字)
 
-啟動 Flask 應用:
+Runtime: Python 3
 
-python app.py
+Build Command: pip install -r requirements.txt
 
-驗證: 打開瀏覽器訪問 http://localhost:5001，您應該能看到一個數據豐富的儀表板。
+Start Command: gunicorn "app:create_app()"
 
-即時模擬模式
-啟動 Flask API 伺服器:
+設定環境變數:
 
-在第一個終端機中：
+在 Environment 區塊新增兩個變數：
 
-conda activate trading_env
-python app.py
+Key: DATABASE_URL, Value: (貼上您剛剛複製的 PostgreSQL 內部 URL)
 
-讓此視窗保持開啟。
+Key: API_SECRET_KEY, Value: (設定一個您自己的、更複雜的密鑰，例如 strong_secret_from_render)
 
-啟動 n8n 服務:
+部署！: 點擊 Create Web Service。Render 會自動開始建立環境、安裝套件並啟動您的應用。完成後，您會得到一個 ...onrender.com 的公開網址。
 
-在第二個終端機中：
+第二部分：設定 n8n.cloud
+註冊 n8n.cloud: 前往 n8n.cloud 並註冊一個免費帳號。
 
-n8n
+設定工作流:
 
-讓此視窗也保持開啟。
+登入後，像之前一樣匯入 trading_bot_workflow.json。
 
-設定 n8n 工作流:
+設定 HTTP Header Auth 憑證，這次的 Value 要使用您在 Render 環境變數中設定的那個更安全的 API_SECRET_KEY。
 
-打開瀏覽器，訪問 http://localhost:5678。
+修改 HTTP Request 節點的 URL，將其改為您從 Render 拿到的公開網址，例如：https://trading-platform.onrender.com/api/trigger-trade-check
 
-依照之前的教學，匯入 trading_bot_workflow.json 並設定好 API 金鑰與 URL。
+啟動工作流，大功告成！
 
-啟動 (Active) 工作流。
-
-開始使用:
-
-訪問 http://localhost:5001。
-
-在「即時儀表板」中設定您想監控的標的和資金，n8n 將會根據排程自動更新數據。
+現在，您的整個系統都運行在雲端，任何人都可以透過網址訪問您的儀表板，而 n8n.cloud 也會準時地在背景觸發您的交易機器人。
