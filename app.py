@@ -9,6 +9,7 @@ import traceback
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template_string, request, jsonify
+import requests # <--- 新增 requests
 
 # --- 1. 全域設定與參數 ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -20,10 +21,15 @@ ADD_ON_SHARES = 1000
 MAX_POSITION_SHARES = 3000
 STOP_LOSS_PCT = 0.02
 
-# --- 2. 核心資料庫函式 ---
+# --- ▼▼▼ 關鍵修正：建立帶有偽裝標頭的 Session ▼▼▼ ---
+session = requests.Session()
+session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+# --- ▲▲▲ 關鍵修正 ▲▲▲ ---
+
+
+# --- 2. 核心資料庫函式 (保持不變) ---
 def get_db_connection():
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL 環境變數未設定！")
+    if not DATABASE_URL: raise ValueError("DATABASE_URL 環境變數未設定！")
     conn = psycopg2.connect(DATABASE_URL)
     return conn
 
@@ -178,13 +184,18 @@ def calculate_latest_signal(df):
     return signal
 
 def get_latest_price_and_signal(stock_id):
-    df_latest_raw = yf.download(stock_id, period="1d", interval="1m", progress=False)
-    if df_latest_raw.empty: df_latest_raw = yf.download(stock_id, period="2d", interval="1d", progress=False)
+    # --- ▼▼▼ 關鍵修正：將偽裝的 session 傳遞給 yfinance ▼▼▼ ---
+    df_latest_raw = yf.download(stock_id, period="1d", interval="1m", progress=False, session=session)
+    if df_latest_raw.empty: df_latest_raw = yf.download(stock_id, period="2d", interval="1d", progress=False, session=session)
+    # --- ▲▲▲ 關鍵修正 ▲▲▲ ---
     df_latest = clean_df(df_latest_raw)
     if df_latest is None: return None, None, None
     latest_price = df_latest['close'].iloc[-1]
     latest_time = df_latest.index[-1]
-    df_daily_raw = yf.download(stock_id, period="40d", interval="1d", progress=False)
+    
+    # --- ▼▼▼ 關鍵修正：將偽裝的 session 傳遞給 yfinance ▼▼▼ ---
+    df_daily_raw = yf.download(stock_id, period="40d", interval="1d", progress=False, session=session)
+    # --- ▲▲▲ 關鍵修正 ▲▲▲ ---
     df_daily = clean_df(df_daily_raw)
     if df_daily is None: return latest_price, latest_time, "日線資料異常"
     df_daily['sma_5'] = df_daily.ta.sma(length=5, close='close')
@@ -389,9 +400,14 @@ def get_live_dashboard_data():
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            stock_id = get_setting('live_stock_id')
+            cur.execute("SELECT value FROM settings WHERE key = %s", ('live_stock_id',))
+            stock_id_result = cur.fetchone()
+            stock_id = stock_id_result['value'] if stock_id_result else '2308.TW'
+
             stock_specific_cash_key = f"initial_cash_{stock_id}"
-            initial_cash = get_setting(stock_specific_cash_key) or CASH
+            cur.execute("SELECT value FROM settings WHERE key = %s", (stock_specific_cash_key,))
+            initial_cash_result = cur.fetchone()
+            initial_cash = initial_cash_result['value'] if initial_cash_result else CASH
 
             cur.execute("SELECT * FROM trades WHERE stock_id = %s ORDER BY timestamp DESC", (stock_id,))
             trades = cur.fetchall()
@@ -414,7 +430,7 @@ def get_live_dashboard_data():
             
             return {
                 "chart_data": {'dates': [p['date'] for p in performance], 'values': [p['asset_value'] for p in performance]},
-                "trades": trades,
+                "trades": [dict(row) for row in trades],
                 "latest_price": latest_price,
                 "latest_signal": latest_signal,
                 "total_asset": total_asset,
@@ -445,7 +461,7 @@ def handle_backtest():
     initial_cash = int(params.get('initial_cash', CASH))
     if not end_date: end_date = pd.Timestamp.now().strftime('%Y-%m-%d')
     
-    df_raw = yf.download(stock_id, start=start_date, end=end_date, progress=False)
+    df_raw = yf.download(stock_id, start=start_date, end=end_date, progress=False, session=session)
     df = clean_df(df_raw)
     if df is None: return jsonify({"error": "無法下載或清理資料"}), 400
     
@@ -517,6 +533,7 @@ def create_app():
 
 # --- 6. 程式主進入點 (僅供本地開發使用) ---
 if __name__ == '__main__':
+    # 在本地啟動時，也確保資料庫已設定
     setup_database()
     app.run(host='0.0.0.0', port=5001, debug=True)
 
