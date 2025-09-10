@@ -184,44 +184,86 @@ def calculate_latest_signal(df):
     return signal
 
 def get_latest_price_and_signal(stock_id):
-    # --- ▼▼▼ 關鍵修正：將偽裝的 session 傳遞給 yfinance ▼▼▼ ---
-    df_latest_raw = yf.download(stock_id, period="1d", interval="1m", progress=False, session=session)
-    if df_latest_raw.empty: df_latest_raw = yf.download(stock_id, period="2d", interval="1d", progress=False, session=session)
-    # --- ▲▲▲ 關鍵修正 ▲▲▲ ---
-    df_latest = clean_df(df_latest_raw)
-    if df_latest is None: return None, None, None
-    latest_price = df_latest['close'].iloc[-1]
-    latest_time = df_latest.index[-1]
+    latest_price, latest_time, signal = None, None, "未知錯誤"
+    try:
+        # --- 嘗試下載一分鐘資料 ---
+        df_latest_raw = yf.download(stock_id, period="1d", interval="1m", progress=False, session=session)
+        
+        # 如果一分鐘資料是空的，可能是非交易時間，嘗試下載日線資料
+        if df_latest_raw.empty:
+            print(f"⚠️ 無法下載 {stock_id} 的分鐘資料，嘗試下載日線資料...")
+            df_latest_raw = yf.download(stock_id, period="2d", interval="1d", progress=False, session=session)
+
+        df_latest = clean_df(df_latest_raw)
+        if df_latest is None or df_latest.empty:
+            print(f"❌ 無法獲取或清理 {stock_id} 的最新資料。")
+            return None, None, "無法獲取資料"
+
+        latest_price = df_latest['close'].iloc[-1]
+        latest_time = df_latest.index[-1]
+        
+        # --- 嘗試下載日線資料以計算訊號 ---
+        df_daily_raw = yf.download(stock_id, period="40d", interval="1d", progress=False, session=session)
+        df_daily = clean_df(df_daily_raw)
+        if df_daily is None or df_daily.empty:
+            print(f"❌ 無法獲取或清理 {stock_id} 的日線歷史資料。")
+            signal = "日線資料異常"
+        else:
+            df_daily['sma_5'] = df_daily.ta.sma(length=5, close='close')
+            df_daily['sma_20'] = df_daily.ta.sma(length=20, close='close')
+            if df_daily['sma_20'].isnull().all():
+                print(f"❌ {stock_id} 的 SMA 指標計算失敗。")
+                signal = "指標計算失敗"
+            else:
+                signal = calculate_latest_signal(df_daily)
+                
+    except Exception as e:
+        # 捕捉所有可能的錯誤，例如 JSONDecodeError 或網路錯誤
+        print(f"❌ 在下載或處理 {stock_id} 資料時發生意外錯誤: {e}")
+        # 為了除錯，列印詳細的錯誤堆疊
+        import traceback
+        traceback.print_exc()
+        signal = "下載發生錯誤"
     
-    # --- ▼▼▼ 關鍵修正：將偽裝的 session 傳遞給 yfinance ▼▼▼ ---
-    df_daily_raw = yf.download(stock_id, period="40d", interval="1d", progress=False, session=session)
-    # --- ▲▲▲ 關鍵修正 ▲▲▲ ---
-    df_daily = clean_df(df_daily_raw)
-    if df_daily is None: return latest_price, latest_time, "日線資料異常"
-    df_daily['sma_5'] = df_daily.ta.sma(length=5, close='close')
-    df_daily['sma_20'] = df_daily.ta.sma(length=20, close='close')
-    if df_daily['sma_20'].isnull().all(): return latest_price, latest_time, "指標計算失敗"
-    signal = calculate_latest_signal(df_daily)
     return latest_price, latest_time, signal
 
 def run_trading_job():
     stock_id = get_setting('live_stock_id') or "2308.TW"
     try:
+        # 使用更新後的函式
         latest_price, latest_time, signal = get_latest_price_and_signal(stock_id)
-        if latest_price is None: return {"status": "error", "message": "無法獲取最新價格資料"}
-        if "失敗" in signal or "異常" in signal: return {"status": "error", "message": signal}
+        
+        if latest_price is None:
+            # 在這裡直接處理無法獲取價格的錯誤
+            message = f"❌ 無法獲取 {stock_id} 的最新價格資料。交易檢查已跳過。原因: {signal}"
+            print(message)
+            return {"status": "error", "message": message}
+            
+        if "錯誤" in signal or "異常" in signal:
+            # 在這裡處理訊號計算的錯誤
+            message = f"❌ {stock_id} 的訊號計算失敗。原因: {signal}"
+            print(message)
+            return {"status": "error", "message": message}
+
         portfolio = get_current_portfolio(stock_id)
         stop_loss_triggered = check_stop_loss(latest_time, latest_price, portfolio, stock_id)
+        
         if not stop_loss_triggered:
             execute_trade(latest_time, signal, latest_price, portfolio, stock_id)
+            
         final_portfolio = get_current_portfolio(stock_id)
         total_asset = final_portfolio['cash'] + (final_portfolio['position'] * latest_price)
         log_performance(latest_time.date(), stock_id, total_asset)
-        message = f"檢查完成。總資產: {total_asset:,.2f}"
+        
+        message = f"✅ {stock_id} 交易檢查完成。總資產: {total_asset:,.2f}"
+        print(message)
         return {"status": "success", "message": message}
+        
     except Exception as e:
+        message = f"❌ 運行交易任務時發生意外錯誤: {e}"
+        print(message)
         traceback.print_exc()
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": message}
 
 # --- 4. Flask Web 應用 ---
 app = Flask(__name__)
