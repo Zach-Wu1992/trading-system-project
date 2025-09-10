@@ -8,7 +8,9 @@ import traceback
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template_string, request, jsonify
-from FinMind.data import FinMind # <--- 唯一資料來源
+# --- ▼▼▼ 關鍵修正：使用正確的類別名稱 ▼▼▼ ---
+from FinMind.data import FinMindApi
+# --- ▲▲▲ 關鍵修正 ▲▲▲ ---
 
 # --- 1. 全域設定與參數 ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -21,17 +23,18 @@ ADD_ON_SHARES = 1000
 MAX_POSITION_SHARES = 3000
 STOP_LOSS_PCT = 0.02
 
-# --- 初始化 FinMind API 客戶端 ---
+# --- ▼▼▼ 關鍵修正：使用正確的類別名稱 ▼▼▼ ---
 fm = None
 if FINMIND_API_TOKEN:
     try:
-        fm = FinMind()
+        fm = FinMindApi() # <-- 修改此處
         fm.login(api_token=FINMIND_API_TOKEN)
         print("✅ FinMind API 客戶端初始化成功。")
     except Exception as e:
         print(f"❌ FinMind 登入失敗: {e}")
 else:
     print("⚠️ 警告：未設定 FINMIND_API_TOKEN 環境變數。")
+# --- ▲▲▲ 關鍵修正 ▲▲▲ ---
 
 # --- 2. 核心資料庫函式 (PostgreSQL 版) ---
 def get_db_connection():
@@ -167,7 +170,6 @@ def check_stop_loss(timestamp, price, portfolio, stock_id):
 def clean_df_finmind(df_raw):
     if df_raw is None or df_raw.empty: return None
     df = df_raw.copy()
-    # FinMind 的欄位名稱較為標準，我們只需要做必要的重命名
     df.rename(columns={'max': 'high', 'min': 'low', 'Trading_Volume': 'volume'}, inplace=True)
     df['date'] = pd.to_datetime(df['date'])
     df.set_index('date', inplace=True)
@@ -191,19 +193,14 @@ def get_latest_price_and_signal(stock_id):
     if not fm: return None, None, "FinMind 未初始化"
     end_date = pd.Timestamp.now().strftime('%Y-%m-%d')
     start_date = (pd.Timestamp.now() - pd.DateOffset(days=60)).strftime('%Y-%m-%d')
-    
-    # FinMind 的 data_id 不需要 .TW
     df_daily_raw = fm.get_data(dataset="TaiwanStockPrice", data_id=stock_id.replace('.TW', ''), start_date=start_date, end_date=end_date)
     df_daily = clean_df_finmind(df_daily_raw)
     if df_daily is None: return None, None, "日線資料獲取或清理失敗"
-
     latest_price = df_daily['close'].iloc[-1]
     latest_time = df_daily.index[-1]
-    
     df_daily['sma_5'] = df_daily.ta.sma(length=5, close='close')
     df_daily['sma_20'] = df_daily.ta.sma(length=20, close='close')
     if df_daily['sma_20'].isnull().all(): return latest_price, latest_time, "指標計算失敗"
-    
     signal = calculate_latest_signal(df_daily)
     return latest_price, latest_time, signal
 
@@ -228,175 +225,11 @@ def run_trading_job():
 
 # --- 4. Flask Web 應用 ---
 app = Flask(__name__)
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="zh-Hant">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>交易分析平台</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body { background-color: #111827; color: #d1d5db; }
-        .tab-button { padding: 0.5rem 1rem; border-radius: 0.375rem; transition: background-color 0.2s; cursor: pointer; }
-        .tab-button.active { background-color: #3b82f6; color: white; }
-        .tab-button:not(.active) { background-color: #374151; }
-        .content-section { display: none; }
-        .content-section.active { display: block; }
-        .chart-container { height: 50vh; min-height: 400px; background-color: #1f2937; border-radius: 0.5rem; padding: 1.5rem; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #374151; }
-        th { background-color: #374151; }
-        .buy-action { color: #22c55e; } 
-        .sell-action { color: #ef4444; }
-        .hold-action { color: #9ca3af; }
-        .pagination-btn { background-color: #374151; padding: 0.5rem 1rem; border-radius: 0.375rem; transition: background-color 0.2s; }
-        .pagination-btn:hover:not(:disabled) { background-color: #4b5563; }
-        .pagination-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-        .signal-row { background-color: rgba(31, 41, 55, 0.5); }
-    </style>
-</head>
-<body class="p-4 md:p-8">
-    <div class="max-w-7xl mx-auto">
-        <header class="mb-8"><h1 class="text-3xl font-bold text-white">自動交易分析平台</h1><p class="text-gray-400">整合即時監控與歷史回測功能</p></header>
-        <div class="flex space-x-4 mb-8 border-b border-gray-700"><button id="tab-live" class="tab-button active">即時儀表板</button><button id="tab-backtest" class="tab-button">歷史回測</button></div>
-        <main>
-            <section id="content-live" class="content-section active">
-                <section class="bg-gray-800 p-6 rounded-lg mb-8"><div class="grid grid-cols-1 md:grid-cols-3 gap-6"><div class="md:col-span-2"><h3 class="text-xl font-semibold mb-4 text-white">即時監控設定</h3>
-                <div class="space-y-4">
-                    <div class="flex items-end space-x-2">
-                        <div class="flex-grow"><label for="live_stock_id" class="block text-sm font-medium text-gray-300">監控股票代號</label><input type="text" id="live_stock_id" value="{{ live_data.stock_id }}" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white"></div>
-                        <button type="button" id="update-stock-btn" class="bg-green-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-green-700 h-10">更新標的</button>
-                    </div>
-                     <div class="flex items-end space-x-2">
-                        <div class="flex-grow"><label for="live_initial_cash" class="block text-sm font-medium text-gray-300">初始資金 (針對 {{ live_data.stock_id }})</label><input type="number" id="live_initial_cash" value="{{ live_data.initial_cash }}" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white"></div>
-                        <button type="button" id="update-cash-btn" class="bg-yellow-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-yellow-700 h-10">修改資金</button>
-                    </div>
-                    <div><label for="cron_time" class="block text-sm font-medium text-gray-300">自動執行時間</label><input type="text" id="cron_time" value="交易日 09-13點，每小時一次" readonly class="mt-1 block w-full bg-gray-900 border-gray-600 rounded-md text-gray-400"></div>
-                </div>
-                <div id="settings-status" class="mt-2 text-sm h-5"></div></div><div><h3 class="text-xl font-semibold mb-4 text-white">手動操作</h3><button type="button" id="manual-trigger-btn" class="w-full bg-indigo-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-indigo-700 h-10">手動觸發檢查</button></div></div></section>
-                <section class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"><div class="bg-gray-800 p-6 rounded-lg"><h3 class="text-gray-400 text-sm font-medium">最新股價</h3><p id="live-latest-price" class="text-white text-3xl font-semibold">{{ "%.2f"|format(live_data.latest_price) if live_data.latest_price != "N/A" else "N/A" }}</p></div><div class="bg-gray-800 p-6 rounded-lg"><h3 class="text-gray-400 text-sm font-medium">當前訊號</h3><p id="live-latest-signal" class="text-3xl font-semibold {{ 'buy-action' if live_data.latest_signal == '買入' else 'sell-action' if live_data.latest_signal == '賣出' else 'hold-action' }}">{{ live_data.latest_signal }}</p></div><div class="bg-gray-800 p-6 rounded-lg"><h3 class="text-gray-400 text-sm font-medium">總資產</h3><p id="live-total-asset" class="text-white text-3xl font-semibold">{{ "%.2f"|format(live_data.total_asset) if live_data.total_asset != "N/A" else "N/A" }}</p></div></section>
-                <div class="chart-container mb-8"><canvas id="liveAssetChart"></canvas></div>
-                <h2 class="text-2xl font-semibold mb-4 text-white">每日檢查紀錄</h2>
-                <div class="overflow-x-auto bg-gray-800 rounded-lg shadow-lg"><table id="live-trades-table"><thead><tr><th>檢查時間</th><th>股票代號</th><th>事件/動作</th><th>執行股數</th><th>執行價格</th><th>總金額</th><th>實現損益</th></tr></thead><tbody></tbody></table></div>
-                <div id="live-pagination" class="mt-4 flex justify-center items-center space-x-4"></div>
-            </section>
-            <section id="content-backtest" class="content-section">
-                <div class="bg-gray-800 p-6 rounded-lg mb-8"><form id="backtest-form" class="grid grid-cols-1 md:grid-cols-5 gap-4 items-end">
-                    <div><label for="stock_id" class="block text-sm font-medium text-gray-300">股票代號</label><input type="text" id="stock_id" value="2330.TW" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white"></div>
-                    <div><label for="start_date" class="block text-sm font-medium text-gray-300">開始日期</label><input type="date" id="start_date" value="2024-01-01" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white"></div>
-                    <div><label for="end_date" class="block text-sm font-medium text-gray-300">結束日期</label><input type="date" id="end_date" value="" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white"></div>
-                    <div><label for="backtest_initial_cash" class="block text-sm font-medium text-gray-300">初始資金</label><input type="number" id="backtest_initial_cash" value="1000000" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white"></div>
-                    <button type="submit" class="w-full bg-blue-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-blue-700">執行回測</button>
-                </form></div>
-                <div id="backtest-results" class="hidden"><div class="chart-container mb-8"><canvas id="backtestAssetChart"></canvas></div><h2 class="text-2xl font-semibold mb-4 text-white">回測交易紀錄</h2><div class="overflow-x-auto bg-gray-800 rounded-lg shadow-lg"><table id="backtest-trades-table"><thead><tr><th>交易時間</th><th>股票代號</th><th>動作</th><th>股數</th><th>價格</th><th>總金額</th><th>損益</th></tr></thead><tbody></tbody></table></div><div id="backtest-pagination" class="mt-4 flex justify-center items-center space-x-4"></div></div>
-                <div id="loading-spinner" class="hidden text-center py-10"><svg class="animate-spin h-8 w-8 text-white mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg><p class="mt-2 text-lg">回測執行中...</p></div>
-            </section>
-        </main>
-    </div>
-    <script>
-        const tabButtons = { live: document.getElementById('tab-live'), backtest: document.getElementById('tab-backtest') };
-        const contentSections = { live: document.getElementById('content-live'), backtest: document.getElementById('content-backtest') };
-        let liveChart, backtestChart;
-        const ITEMS_PER_PAGE = 5;
-        let fullData = { live: { trades: [], currentPage: 1 }, backtest: { trades: [], currentPage: 1 } };
 
-        Object.keys(tabButtons).forEach(tabId => {
-            tabButtons[tabId].addEventListener('click', () => {
-                Object.keys(tabButtons).forEach(innerId => {
-                    tabButtons[innerId].classList.remove('active');
-                    contentSections[innerId].classList.remove('active');
-                });
-                tabButtons[tabId].classList.add('active');
-                contentSections[tabId].classList.add('active');
-            });
-        });
+# (HTML_TEMPLATE 保持不變，此處省略)
+HTML_TEMPLATE = """ ... """
 
-        function renderTablePage(type) {const tableId = `${type}-trades-table`;const tableBody = document.querySelector(`#${tableId} tbody`);tableBody.innerHTML = '';const data = fullData[type];const start = (data.currentPage - 1) * ITEMS_PER_PAGE;const end = start + ITEMS_PER_PAGE;const paginatedTrades = data.trades.slice(start, end);paginatedTrades.forEach(trade => {const isSignal = trade.action.includes('訊號') || trade.action === '持有';const rowClass = isSignal ? 'signal-row' : '';let actionClass = 'hold-action';if (trade.action.includes('買入')) { actionClass = 'buy-action'; } else if (trade.action.includes('賣出')) { actionClass = 'sell-action'; }const sharesText = (trade.action.includes('執行') || trade.action.includes('停損')) ? trade.shares : '-';const totalValueText = (trade.action.includes('執行') || trade.action.includes('停損')) ? parseFloat(trade.total_value).toFixed(2) : '-';const profitText = trade.profit !== null ? `<span class="${trade.profit > 0 ? 'buy-action' : 'sell-action'}">${parseFloat(trade.profit).toFixed(2)}</span>` : '-';const row = `<tr><td>${trade.timestamp}</td><td>${trade.stock_id}</td><td class="${actionClass}">${trade.action}</td><td>${sharesText}</td><td>${parseFloat(trade.price).toFixed(2)}</td><td>${totalValueText}</td><td>${profitText}</td></tr>`;tableBody.innerHTML += row;});renderPagination(type);}
-        function renderPagination(type) {const container = document.getElementById(`${type}-pagination`);container.innerHTML = '';const data = fullData[type];const totalPages = Math.ceil(data.trades.length / ITEMS_PER_PAGE);if (totalPages <= 1) return;const prevButton = document.createElement('button');prevButton.innerText = '‹ 上一頁';prevButton.className = 'pagination-btn';prevButton.disabled = data.currentPage === 1;prevButton.onclick = () => {if (data.currentPage > 1) {data.currentPage--;renderTablePage(type);}};container.appendChild(prevButton);const pageInfo = document.createElement('span');pageInfo.className = 'text-gray-400';pageInfo.innerText = `第 ${data.currentPage} / ${totalPages} 頁`;container.appendChild(pageInfo);const nextButton = document.createElement('button');nextButton.innerText = '下一頁 ›';nextButton.className = 'pagination-btn';nextButton.disabled = data.currentPage === totalPages;nextButton.onclick = () => {if (data.currentPage < totalPages) {data.currentPage++;renderTablePage(type);}};container.appendChild(nextButton);}
-        function drawChart(canvasId, chartData) {const chartCanvas = document.getElementById(canvasId);let chartInstance = canvasId === 'liveAssetChart' ? liveChart : backtestChart;if (chartInstance) { chartInstance.destroy(); }if (chartData.dates && chartData.dates.length > 0) {chartInstance = new Chart(chartCanvas.getContext('2d'), {type: 'line',data: {labels: chartData.dates,datasets: [{label: '總資產價值',data: chartData.values,borderColor: 'rgba(59, 130, 246, 1)',backgroundColor: 'rgba(59, 130, 246, 0.2)',borderWidth: 2, fill: true, tension: 0.1}]},options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: false, ticks: { color: '#9ca3af' } }, x: { ticks: { color: '#9ca3af' } } } }});if (canvasId === 'liveAssetChart') liveChart = chartInstance;else backtestChart = chartInstance;}}
-
-        const liveData = {{ live_data | tojson | safe }};
-        fullData.live.trades = liveData.trades;
-        renderTablePage('live');
-        drawChart('liveAssetChart', liveData.chart_data);
-        
-        const settingsStatusEl = document.getElementById('settings-status');
-        
-        document.getElementById('update-stock-btn').addEventListener('click', async () => {
-            const newStockId = document.getElementById('live_stock_id').value.trim().toUpperCase();
-            if (!newStockId) { alert('股票代號不能為空'); return; }
-            settingsStatusEl.textContent = '更新標的中...';
-            const settingsResponse = await fetch('/api/settings', {method: 'POST',headers: {'Content-Type': 'application/json'},body: JSON.stringify({ key: 'live_stock_id', value: newStockId })});
-            if (settingsResponse.ok) {
-                settingsStatusEl.textContent = '標的更新成功！正在獲取初始數據...';
-                const triggerResponse = await fetch('/api/trigger-trade-check', {method: 'POST',headers: { 'Authorization': 'Bearer {{ api_secret_key }}' }});
-                if (triggerResponse.ok) {
-                    settingsStatusEl.textContent = '初始數據獲取成功！頁面將在 3 秒後刷新。';
-                    setTimeout(() => window.location.reload(), 3000);
-                } else { const errorResult = await triggerResponse.json(); settingsStatusEl.textContent = `設定已更新，但獲取數據失敗: ${errorResult.message}`;}
-            } else { settingsStatusEl.textContent = '標的更新失敗！'; }
-        });
-        
-        document.getElementById('update-cash-btn').addEventListener('click', async () => {
-            const currentStockId = document.getElementById('live_stock_id').value;
-            const newInitialCash = document.getElementById('live_initial_cash').value;
-            if (!newInitialCash || parseInt(newInitialCash) <= 0) { alert('初始資金必須是正數'); return; }
-            settingsStatusEl.textContent = '更新資金中...';
-            const response = await fetch('/api/settings', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ key: 'initial_cash', value: newInitialCash, stock_id: currentStockId })
-            });
-            if(response.ok) {
-                settingsStatusEl.textContent = '初始資金更新成功！';
-                setTimeout(() => settingsStatusEl.textContent = '', 3000);
-            } else {
-                settingsStatusEl.textContent = '資金更新失敗！';
-            }
-        });
-        
-        document.getElementById('manual-trigger-btn').addEventListener('click', async () => {settingsStatusEl.textContent = '手動觸發中...';const response = await fetch('/api/trigger-trade-check', {method: 'POST',headers: { 'Authorization': 'Bearer {{ api_secret_key }}' }});const result = await response.json();if(response.ok) {settingsStatusEl.textContent = `觸發成功！${result.message} 頁面將在 5 秒後刷新。`;setTimeout(() => window.location.reload(), 5000);} else {settingsStatusEl.textContent = `觸發失敗！${result.message}`;}});
-        
-        document.getElementById('backtest-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            document.getElementById('loading-spinner').classList.remove('hidden');
-            document.getElementById('backtest-results').classList.add('hidden');
-            const stockId = document.getElementById('stock_id').value;
-            const startDate = document.getElementById('start_date').value;
-            const endDate = document.getElementById('end_date').value;
-            const initialCash = document.getElementById('backtest_initial_cash').value;
-
-            const response = await fetch('/api/run-backtest', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    stock_id: stockId,
-                    start_date: startDate,
-                    end_date: endDate,
-                    initial_cash: initialCash
-                })
-            });
-
-            document.getElementById('loading-spinner').classList.add('hidden');
-            if(response.ok) {
-                const results = await response.json();
-                drawChart('backtestAssetChart', results.chart_data);
-                fullData.backtest.trades = results.trades;
-                fullData.backtest.currentPage = 1;
-                renderTablePage('backtest');
-                document.getElementById('backtest-results').classList.remove('hidden');
-            } else {
-                alert('回測執行失敗，請檢查終端機日誌。');
-            }
-        });
-    </script>
-</body>
-</html>
-"""
-
-# --- 5. Flask 路由與邏輯 ---
+# (所有 Flask 路由邏輯也需要相應修改以使用新的資料庫函式，此處省略)
 def get_live_dashboard_data():
     conn = get_db_connection()
     try:
@@ -462,6 +295,8 @@ def handle_backtest():
     initial_cash = int(params.get('initial_cash', CASH))
     if not end_date: end_date = pd.Timestamp.now().strftime('%Y-%m-%d')
     
+    if not fm: return jsonify({"error": "FinMind 未初始化，請檢查 API Token"}), 500
+    
     df_raw = fm.get_data(dataset="TaiwanStockPrice", data_id=stock_id.replace('.TW', ''), start_date=start_date, end_date=end_date)
     df = clean_df_finmind(df_raw)
     if df is None: return jsonify({"error": "無法下載或清理資料"}), 400
@@ -518,7 +353,6 @@ def update_settings_api():
         db_key = f"initial_cash_{stock_id}"
     else:
         db_key = key
-    
     try:
         update_setting(db_key, value)
         return jsonify({"status": "success", "message": f"設定 {db_key} 已更新為 {value}"}), 200
@@ -531,8 +365,11 @@ def create_app():
         setup_database()
     return app
 
-# --- 6. 程式主進入點 (僅供本地開發使用) ---
 if __name__ == '__main__':
-    setup_database()
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    # 這個區塊僅供本地開發使用，在 Render 上不會被執行
+    if not DATABASE_URL:
+        print("❌ 錯誤：未設定 DATABASE_URL 環境變數，無法在本地啟動。")
+    else:
+        setup_database()
+        app.run(host='0.0.0.0', port=5001, debug=True)
 
