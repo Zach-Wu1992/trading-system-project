@@ -8,7 +8,7 @@ import traceback
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template_string, request, jsonify
-from FinMind.data import FinMindApi # <--- 使用 FinMind
+from FinMind.data import FinMindApi
 
 # --- 1. 全域設定與參數 ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -26,6 +26,7 @@ fm = None
 if FINMIND_API_TOKEN:
     try:
         fm = FinMindApi()
+        # 使用 'api_token' 而不是 'token'
         fm.login(api_token=FINMIND_API_TOKEN)
         print("✅ FinMind API 客戶端初始化成功。")
     except Exception as e:
@@ -44,9 +45,26 @@ def setup_database():
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(''' CREATE TABLE IF NOT EXISTS trades ( trade_id SERIAL PRIMARY KEY, timestamp TEXT NOT NULL, stock_id TEXT NOT NULL, action TEXT NOT NULL, shares INTEGER NOT NULL, price REAL NOT NULL, total_value REAL NOT NULL, profit REAL ) ''')
-            cur.execute(''' CREATE TABLE IF NOT EXISTS daily_performance ( date TEXT NOT NULL, stock_id TEXT NOT NULL, asset_value REAL NOT NULL, PRIMARY KEY (date, stock_id) ) ''')
-            cur.execute(''' CREATE TABLE IF NOT EXISTS settings ( key TEXT PRIMARY KEY, value TEXT NOT NULL ) ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS trades (
+                    trade_id SERIAL PRIMARY KEY, timestamp TEXT NOT NULL, stock_id TEXT NOT NULL,
+                    action TEXT NOT NULL, shares INTEGER NOT NULL, price REAL NOT NULL,
+                    total_value REAL NOT NULL, profit REAL
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS daily_performance (
+                    date TEXT NOT NULL,
+                    stock_id TEXT NOT NULL,
+                    asset_value REAL NOT NULL,
+                    PRIMARY KEY (date, stock_id)
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL
+                )
+            ''')
             cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING", ('live_stock_id', '2308.TW'))
         conn.commit()
         print("✅ 資料庫設定完成。")
@@ -155,7 +173,9 @@ def clean_df_finmind(df_raw):
     df['date'] = pd.to_datetime(df['date'])
     df.set_index('date', inplace=True)
     required_cols = ['open', 'high', 'low', 'close', 'volume']
-    if not all(col in df.columns for col in required_cols): return None
+    if not all(col in df.columns for col in required_cols):
+        print(f"❌ FinMind 資料清理失敗：缺少必要欄位. 現有: {df.columns.tolist()}")
+        return None
     return df
 
 def calculate_latest_signal(df):
@@ -204,148 +224,70 @@ def run_trading_job():
 
 # --- 4. Flask Web 應用 ---
 app = Flask(__name__)
-HTML_TEMPLATE = """ ... """ # (HTML 模板不變，此處省略)
+app.config['TEMPLATES_AUTO_RELOAD'] = True
 
-def get_live_dashboard_data():
-    conn = get_db_connection()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT value FROM settings WHERE key = %s", ('live_stock_id',))
-            stock_id_result = cur.fetchone()
-            stock_id = stock_id_result['value'] if stock_id_result else '2308.TW'
-
-            stock_specific_cash_key = f"initial_cash_{stock_id}"
-            cur.execute("SELECT value FROM settings WHERE key = %s", (stock_specific_cash_key,))
-            initial_cash_result = cur.fetchone()
-            initial_cash = initial_cash_result['value'] if initial_cash_result else CASH
-
-            cur.execute("SELECT * FROM trades WHERE stock_id = %s ORDER BY timestamp DESC", (stock_id,))
-            trades = cur.fetchall()
-            cur.execute("SELECT * FROM daily_performance WHERE stock_id = %s ORDER BY date ASC", (stock_id,))
-            performance = cur.fetchall()
-
-            latest_price, latest_signal = "N/A", "N/A"
-            try:
-                latest_price, _, latest_signal = get_latest_price_and_signal(stock_id)
-                if latest_price is None: latest_price = "N/A"
-                if latest_signal is None: latest_signal = "N/A"
-            except Exception as e:
-                print(f"❌ 獲取儀表板即時數據時發生錯誤: {e}")
-
-            if performance:
-                total_asset = performance[-1]['asset_value']
-            else:
-                current_portfolio = get_current_portfolio(stock_id)
-                total_asset = current_portfolio['cash']
-            
-            return {
-                "chart_data": {'dates': [p['date'] for p in performance], 'values': [p['asset_value'] for p in performance]},
-                "trades": [dict(row) for row in trades],
-                "latest_price": latest_price,
-                "latest_signal": latest_signal,
-                "total_asset": total_asset,
-                "stock_id": stock_id, 
-                "initial_cash": initial_cash
-            }
-    finally:
-        conn.close()
-
-@app.route('/')
-def dashboard():
-    live_data = get_live_dashboard_data()
-    return render_template_string(HTML_TEMPLATE, live_data=live_data, api_secret_key=API_SECRET_KEY)
-
-@app.route('/api/trigger-trade-check', methods=['POST'])
-def trigger_trade_check():
-    auth_header = request.headers.get('Authorization')
-    if auth_header != f"Bearer {API_SECRET_KEY}": return jsonify({"status": "error", "message": "未經授權"}), 401
-    result = run_trading_job()
-    if result.get('status') == 'success': return jsonify(result), 200
-    else: return jsonify(result), 500
-
-@app.route('/api/run-backtest', methods=['POST'])
-def handle_backtest():
-    params = request.get_json()
-    stock_id, start_date = params.get('stock_id', '2330.TW'), params.get('start_date', '2024-01-01')
-    end_date = params.get('end_date') or pd.Timestamp.now().strftime('%Y-%m-%d')
-    initial_cash = int(params.get('initial_cash', CASH))
-    if not end_date: end_date = pd.Timestamp.now().strftime('%Y-%m-%d')
-    
-    if not fm: return jsonify({"error": "FinMind 未初始化，請檢查 API Token"}), 500
-    
-    df_raw = fm.get_data(dataset="TaiwanStockPrice", data_id=stock_id.replace('.TW', ''), start_date=start_date, end_date=end_date)
-    df = clean_df_finmind(df_raw)
-    if df is None: return jsonify({"error": "無法下載或清理資料"}), 400
-    
-    df['sma_5'] = df.ta.sma(length=5, close='close')
-    df['sma_20'] = df.ta.sma(length=20, close='close')
-    if df['sma_20'].isnull().all(): return jsonify({"error": "指標計算失敗"}), 400
-    
-    df['signal'] = "持有"
-    yesterday_sma5, yesterday_sma20 = df['sma_5'].shift(1), df['sma_20'].shift(1)
-    buy_conditions = (df['sma_5'] > df['sma_20']) & (yesterday_sma5 < yesterday_sma20)
-    sell_conditions = (df['sma_5'] < df['sma_20']) & (yesterday_sma5 > yesterday_sma20)
-    df.loc[buy_conditions, 'signal'] = "買入"
-    df.loc[sell_conditions, 'signal'] = "賣出"
-    
-    backtest_portfolio = {'cash': initial_cash, 'position': 0, 'avg_cost': 0}
-    daily_assets, trade_log = [], []
-    for index, row in df.iterrows():
-        price, signal = row['close'], row['signal']
-        if backtest_portfolio['position'] > 0:
-            stop_loss_price = backtest_portfolio['avg_cost'] * (1 - STOP_LOSS_PCT)
-            if price < stop_loss_price:
-                profit = (price - backtest_portfolio['avg_cost']) * backtest_portfolio['position']
-                trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '停損賣出', 'shares': backtest_portfolio['position'], 'price': price, 'total_value': price * backtest_portfolio['position'], 'profit': profit})
-                backtest_portfolio['cash'] += price * backtest_portfolio['position']
-                backtest_portfolio['position'], backtest_portfolio['avg_cost'] = 0, 0
-        if signal == "買入" and backtest_portfolio['position'] < MAX_POSITION_SHARES:
-            if backtest_portfolio['position'] == 0 or price > backtest_portfolio['avg_cost']:
-                if backtest_portfolio['cash'] >= price * ADD_ON_SHARES:
-                    old_total = backtest_portfolio['avg_cost'] * backtest_portfolio['position']
-                    new_total = old_total + (price * ADD_ON_SHARES)
-                    backtest_portfolio['position'] += ADD_ON_SHARES
-                    backtest_portfolio['cash'] -= price * ADD_ON_SHARES
-                    backtest_portfolio['avg_cost'] = new_total / backtest_portfolio['position']
-                    trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '買入', 'shares': ADD_ON_SHARES, 'price': price, 'total_value': price * ADD_ON_SHARES, 'profit': None})
-        elif signal == "賣出" and backtest_portfolio['position'] > 0:
-            profit = (price - backtest_portfolio['avg_cost']) * backtest_portfolio['position']
-            trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '訊號賣出', 'shares': backtest_portfolio['position'], 'price': price, 'total_value': price * backtest_portfolio['position'], 'profit': profit})
-            backtest_portfolio['cash'] += price * backtest_portfolio['position']
-            backtest_portfolio['position'], backtest_portfolio['avg_cost'] = 0, 0
-        daily_assets.append(backtest_portfolio['cash'] + (backtest_portfolio['position'] * price))
-    results = {"chart_data": {"dates": [d.strftime('%Y-%m-%d') for d in df.index],"values": daily_assets},"trades": trade_log}
-    return jsonify(results)
-
-@app.route('/api/settings', methods=['POST'])
-def update_settings_api():
-    data = request.get_json()
-    key, value = data.get('key'), data.get('value')
-    if not key or not value: return jsonify({"status": "error", "message": "缺少 key 或 value"}), 400
-    if key == 'initial_cash':
-        stock_id = data.get('stock_id')
-        if not stock_id:
-            return jsonify({"status": "error", "message": "更新初始資金時必須提供 stock_id"}), 400
-        db_key = f"initial_cash_{stock_id}"
-    else:
-        db_key = key
-    try:
-        update_setting(db_key, value)
-        return jsonify({"status": "success", "message": f"設定 {db_key} 已更新為 {value}"}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-def create_app():
-    # 這個函式是給 Gunicorn 用的
-    with app.app_context():
-        setup_database()
-    return app
-
-# --- 6. 程式主進入點 (僅供本地開發使用) ---
-if __name__ == '__main__':
-    if not DATABASE_URL:
-        print("❌ 錯誤：未設定 DATABASE_URL 環境變數，無法在本地啟動。")
-    else:
-        setup_database()
-        app.run(host='0.0.0.0', port=5001, debug=True)
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>交易分析平台</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { background-color: #111827; color: #d1d5db; }
+        .tab-button { padding: 0.5rem 1rem; border-radius: 0.375rem; transition: background-color 0.2s; cursor: pointer; }
+        .tab-button.active { background-color: #3b82f6; color: white; }
+        .tab-button:not(.active) { background-color: #374151; }
+        .content-section { display: none; }
+        .content-section.active { display: block; }
+        .chart-container { height: 50vh; min-height: 400px; background-color: #1f2937; border-radius: 0.5rem; padding: 1.5rem; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #374151; }
+        th { background-color: #374151; }
+        .buy-action { color: #22c55e; } 
+        .sell-action { color: #ef4444; }
+        .hold-action { color: #9ca3af; }
+        .pagination-btn { background-color: #374151; padding: 0.5rem 1rem; border-radius: 0.375rem; transition: background-color 0.2s; }
+        .pagination-btn:hover:not(:disabled) { background-color: #4b5563; }
+        .pagination-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .signal-row { background-color: rgba(31, 41, 55, 0.5); }
+    </style>
+</head>
+<body class="p-4 md:p-8">
+    <div class="max-w-7xl mx-auto">
+        <header class="mb-8"><h1 class="text-3xl font-bold text-white">自動交易分析平台</h1><p class="text-gray-400">整合即時監控與歷史回測功能</p></header>
+        <div class="flex space-x-4 mb-8 border-b border-gray-700"><button id="tab-live" class="tab-button active">即時儀表板</button><button id="tab-backtest" class="tab-button">歷史回測</button></div>
+        <main>
+            <section id="content-live" class="content-section active">
+                <section class="bg-gray-800 p-6 rounded-lg mb-8"><div class="grid grid-cols-1 md:grid-cols-3 gap-6"><div class="md:col-span-2"><h3 class="text-xl font-semibold mb-4 text-white">即時監控設定</h3>
+                <div class="space-y-4">
+                    <div class="flex items-end space-x-2">
+                        <div class="flex-grow"><label for="live_stock_id" class="block text-sm font-medium text-gray-300">監控股票代號</label><input type="text" id="live_stock_id" value="{{ live_data.stock_id }}" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white"></div>
+                        <button type="button" id="update-stock-btn" class="bg-green-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-green-700 h-10">更新標的</button>
+                    </div>
+                     <div class="flex items-end space-x-2">
+                        <div class="flex-grow"><label for="live_initial_cash" class="block text-sm font-medium text-gray-300">初始資金 (針對 {{ live_data.stock_id }})</label><input type="number" id="live_initial_cash" value="{{ live_data.initial_cash }}" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white"></div>
+                        <button type="button" id="update-cash-btn" class="bg-yellow-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-yellow-700 h-10">修改資金</button>
+                    </div>
+                    <div><label for="cron_time" class="block text-sm font-medium text-gray-300">自動執行時間</label><input type="text" id="cron_time" value="交易日 09-13點，每小時一次" readonly class="mt-1 block w-full bg-gray-900 border-gray-600 rounded-md text-gray-400"></div>
+                </div>
+                <div id="settings-status" class="mt-2 text-sm h-5"></div></div><div><h3 class="text-xl font-semibold mb-4 text-white">手動操作</h3><button type="button" id="manual-trigger-btn" class="w-full bg-indigo-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-indigo-700 h-10">手動觸發檢查</button></div></div></section>
+                <section class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"><div class="bg-gray-800 p-6 rounded-lg"><h3 class="text-gray-400 text-sm font-medium">最新股價</h3><p id="live-latest-price" class="text-white text-3xl font-semibold">{{ "%.2f"|format(live_data.latest_price) if live_data.latest_price != "N/A" else "N/A" }}</p></div><div class="bg-gray-800 p-6 rounded-lg"><h3 class="text-gray-400 text-sm font-medium">當前訊號</h3><p id="live-latest-signal" class="text-3xl font-semibold {{ 'buy-action' if live_data.latest_signal == '買入' else 'sell-action' if live_data.latest_signal == '賣出' else 'hold-action' }}">{{ live_data.latest_signal }}</p></div><div class="bg-gray-800 p-6 rounded-lg"><h3 class="text-gray-400 text-sm font-medium">總資產</h3><p id="live-total-asset" class="text-white text-3xl font-semibold">{{ "%.2f"|format(live_data.total_asset) if live_data.total_asset != "N/A" else "N/A" }}</p></div></section>
+                <div class="chart-container mb-8"><canvas id="liveAssetChart"></canvas></div>
+                <h2 class="text-2xl font-semibold mb-4 text-white">每日檢查紀錄</h2>
+                <div class="overflow-x-auto bg-gray-800 rounded-lg shadow-lg"><table id="live-trades-table"><thead><tr><th>檢查時間</th><th>股票代號</th><th>事件/動作</th><th>執行股數</th><th>執行價格</th><th>總金額</th><th>實現損益</th></tr></thead><tbody></tbody></table></div>
+                <div id="live-pagination" class="mt-4 flex justify-center items-center space-x-4"></div>
+            </section>
+            <section id="content-backtest" class="content-section">
+                <div class="bg-gray-800 p-6 rounded-lg mb-8"><form id="backtest-form" class="grid grid-cols-1 md:grid-cols-5 gap-4 items-end">
+                    <div><label for="stock_id" class="block text-sm font-medium text-gray-300">股票代號</label><input type="text" id="stock_id" value="2330.TW" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white"></div>
+                    <div><label for="start_date" class="block text-sm font-medium text-gray-300">開始日期</label><input type="date" id="start_date" value="2024-01-01" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white"></div>
+                    <div><label for="end_date" class="block text-sm font-medium text-gray-300">結束日期</label><input type="date" id="end_date" value="" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white"></div>
+                    <div><label for="backtest_initial_cash" class="block text-sm font-medium text-gray-300">初始資金</label><input type="number" id="backtest_initial_cash" value="1000000" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white"></div>
+                    <button type="submit" class="w-full bg-blue-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-blue-700">執行回測</button>
+                </form></div>
+                <div id="backtest-results" class="hidden"><div class="chart-container mb-8"><canvas id="backtestAssetChart"></canvas></div><h2 class="text-2xl font-semibold mb-4 text-white">回測交易紀錄</h2><div class="overflow-x-auto bg-gray-800 rounded-lg shadow-lg"><table id="backtest-trades-table"><thead><tr><th>交易時間</th><th>股票代號</th><th>動作</th><th>股數</th><th>價格</th><th>總金額</th><th>損益</th></tr></thead><tbody></tbody></table></div><div id="backtest-pagination" class="mt-4 flex justify-center items-center space-x-4"></div></div>
+                <div id="loading-spinner" class="hidden text-center py-10"><svg class="animate-spin h-8 w-8 text-white mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0
 
