@@ -526,14 +526,12 @@ def update_settings_api():
 
 def create_app():
     # 這個函式是給 Gunicorn 用的
-    # 第一次啟動時，初始化資料庫
     with app.app_context():
         setup_database()
     return app
 
 # --- 6. 程式主進入點 (僅供本地開發使用) ---
 if __name__ == '__main__':
-    # 在本地啟動時，也確保資料庫已設定
     setup_database()
     app.run(host='0.0.0.0', port=5001, debug=True)
 
