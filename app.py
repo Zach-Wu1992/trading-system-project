@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 # --- 匯入函式庫 ---
-import pandas_datareader.data as web
 import pandas as pd
 import pandas_ta as ta
 import os
@@ -9,12 +8,12 @@ import traceback
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template_string, request, jsonify
-import requests # <--- 新增 requests
+from FinMind.data import FinMind # <--- 唯一資料來源
 
 # --- 1. 全域設定與參數 ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
-API_SECRET_KEY = os.environ.get('API_SECRET_KEY', "my_super_secret_key_123_for_local_dev")
-TIINGO_API_KEY = os.environ.get('326146dea48b84b15273e001ad341085f4aa02ca')
+API_SECRET_KEY = os.environ.get('API_SECRET_KEY')
+FINMIND_API_TOKEN = os.environ.get('FINMIND_API_TOKEN')
 
 pd.set_option('display.max_columns', None)
 CASH = 1000000
@@ -22,13 +21,19 @@ ADD_ON_SHARES = 1000
 MAX_POSITION_SHARES = 3000
 STOP_LOSS_PCT = 0.02
 
-# --- ▼▼▼ 關鍵修正：建立帶有偽裝標頭的 Session ▼▼▼ ---
-session = requests.Session()
-session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
-# --- ▲▲▲ 關鍵修正 ▲▲▲ ---
+# --- 初始化 FinMind API 客戶端 ---
+fm = None
+if FINMIND_API_TOKEN:
+    try:
+        fm = FinMind()
+        fm.login(api_token=FINMIND_API_TOKEN)
+        print("✅ FinMind API 客戶端初始化成功。")
+    except Exception as e:
+        print(f"❌ FinMind 登入失敗: {e}")
+else:
+    print("⚠️ 警告：未設定 FINMIND_API_TOKEN 環境變數。")
 
-
-# --- 2. 核心資料庫函式 (保持不變) ---
+# --- 2. 核心資料庫函式 (PostgreSQL 版) ---
 def get_db_connection():
     if not DATABASE_URL: raise ValueError("DATABASE_URL 環境變數未設定！")
     conn = psycopg2.connect(DATABASE_URL)
@@ -113,13 +118,11 @@ def get_current_portfolio(stock_id):
     stock_specific_cash_key = f"initial_cash_{stock_id}"
     initial_cash_str = get_setting(stock_specific_cash_key)
     initial_cash = int(initial_cash_str) if initial_cash_str else CASH
-    
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT action, shares, price FROM trades WHERE stock_id = %s AND (action = '執行買入' OR action LIKE '%%賣出') ORDER BY timestamp ASC", (stock_id,))
             trades = cur.fetchall()
-            
         portfolio = {'cash': initial_cash, 'position': 0, 'avg_cost': 0}
         for trade in trades:
             if trade['action'] == "執行買入":
@@ -161,17 +164,17 @@ def check_stop_loss(timestamp, price, portfolio, stock_id):
             return True
     return False
 
-def clean_df(df_raw):
+def clean_df_finmind(df_raw):
     if df_raw is None or df_raw.empty: return None
     df = df_raw.copy()
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-    rename_map = {}
-    required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-    for col in df.columns:
-        if str(col).capitalize() in required_cols: rename_map[col] = str(col).lower()
-    if len(rename_map) < len(required_cols): return None
-    df.rename(columns=rename_map, inplace=True)
-    df = df[['open', 'high', 'low', 'close', 'volume']]
+    # FinMind 的欄位名稱較為標準，我們只需要做必要的重命名
+    df.rename(columns={'max': 'high', 'min': 'low', 'Trading_Volume': 'volume'}, inplace=True)
+    df['date'] = pd.to_datetime(df['date'])
+    df.set_index('date', inplace=True)
+    required_cols = ['open', 'high', 'low', 'close', 'volume']
+    if not all(col in df.columns for col in required_cols):
+        print(f"❌ FinMind 資料清理失敗：缺少必要欄位. 現有: {df.columns.tolist()}")
+        return None
     return df
 
 def calculate_latest_signal(df):
@@ -185,87 +188,46 @@ def calculate_latest_signal(df):
     return signal
 
 def get_latest_price_and_signal(stock_id):
-    if not TIINGO_API_KEY:
-        return None, None, "Tiingo API 金鑰未設定"
+    if not fm: return None, None, "FinMind 未初始化"
+    end_date = pd.Timestamp.now().strftime('%Y-%m-%d')
+    start_date = (pd.Timestamp.now() - pd.DateOffset(days=60)).strftime('%Y-%m-%d')
     
-    latest_price, latest_time = None, None
-    signal = "未知錯誤"
+    # FinMind 的 data_id 不需要 .TW
+    df_daily_raw = fm.get_data(dataset="TaiwanStockPrice", data_id=stock_id.replace('.TW', ''), start_date=start_date, end_date=end_date)
+    df_daily = clean_df_finmind(df_daily_raw)
+    if df_daily is None: return None, None, "日線資料獲取或清理失敗"
 
-    try:
-        # Tiingo 的即時資料有 15 分鐘延遲，所以直接下載日線資料
-        # 下載最近 40 天的資料來計算 SMA
-        df_daily_raw = web.DataReader(stock_id, 'tiingo', start='2024-01-01', api_key=TIINGO_API_KEY)
-        
-        # 由於 Tiingo 回傳的資料可能不是最新的，這裡需要額外判斷
-        # Tiingo 回傳的 DataFrame 索引是日期，且資料是最新到最舊
-        df_daily = clean_df(df_daily_raw.sort_index()) # 確保資料由舊到新
-        
-        if df_daily is None or df_daily.empty:
-            print(f"❌ 無法獲取或清理 {stock_id} 的日線歷史資料。")
-            signal = "日線資料異常"
-        else:
-            latest_price = df_daily['close'].iloc[-1]
-            latest_time = df_daily.index[-1]
-            
-            # 計算 SMA 指標
-            df_daily['sma_5'] = df_daily.ta.sma(length=5, close='close')
-            df_daily['sma_20'] = df_daily.ta.sma(length=20, close='close')
-            
-            if df_daily['sma_20'].isnull().all():
-                print(f"❌ {stock_id} 的 SMA 指標計算失敗。")
-                signal = "指標計算失敗"
-            else:
-                signal = calculate_latest_signal(df_daily)
-
-    except Exception as e:
-        print(f"❌ 在下載或處理 {stock_id} 的資料時發生意外錯誤: {e}")
-        traceback.print_exc()
-        signal = "下載發生錯誤"
+    latest_price = df_daily['close'].iloc[-1]
+    latest_time = df_daily.index[-1]
     
+    df_daily['sma_5'] = df_daily.ta.sma(length=5, close='close')
+    df_daily['sma_20'] = df_daily.ta.sma(length=20, close='close')
+    if df_daily['sma_20'].isnull().all(): return latest_price, latest_time, "指標計算失敗"
+    
+    signal = calculate_latest_signal(df_daily)
     return latest_price, latest_time, signal
 
 def run_trading_job():
     stock_id = get_setting('live_stock_id') or "2308.TW"
     try:
-        # 使用更新後的函式
         latest_price, latest_time, signal = get_latest_price_and_signal(stock_id)
-        
-        if latest_price is None:
-            # 在這裡直接處理無法獲取價格的錯誤
-            message = f"❌ 無法獲取 {stock_id} 的最新價格資料。交易檢查已跳過。原因: {signal}"
-            print(message)
-            return {"status": "error", "message": message}
-            
-        if "錯誤" in signal or "異常" in signal:
-            # 在這裡處理訊號計算的錯誤
-            message = f"❌ {stock_id} 的訊號計算失敗。原因: {signal}"
-            print(message)
-            return {"status": "error", "message": message}
-
+        if latest_price is None: return {"status": "error", "message": "無法獲取最新價格資料"}
+        if "失敗" in signal or "異常" in signal: return {"status": "error", "message": signal}
         portfolio = get_current_portfolio(stock_id)
         stop_loss_triggered = check_stop_loss(latest_time, latest_price, portfolio, stock_id)
-        
         if not stop_loss_triggered:
             execute_trade(latest_time, signal, latest_price, portfolio, stock_id)
-            
         final_portfolio = get_current_portfolio(stock_id)
         total_asset = final_portfolio['cash'] + (final_portfolio['position'] * latest_price)
         log_performance(latest_time.date(), stock_id, total_asset)
-        
-        message = f"✅ {stock_id} 交易檢查完成。總資產: {total_asset:,.2f}"
-        print(message)
+        message = f"檢查完成。總資產: {total_asset:,.2f}"
         return {"status": "success", "message": message}
-        
     except Exception as e:
-        message = f"❌ 運行交易任務時發生意外錯誤: {e}"
-        print(message)
         traceback.print_exc()
-        return {"status": "error", "message": message}
+        return {"status": "error", "message": str(e)}
 
 # --- 4. Flask Web 應用 ---
 app = Flask(__name__)
-app.config['TEMPLATES_AUTO_RELOAD'] = True
-
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-Hant">
@@ -500,13 +462,13 @@ def handle_backtest():
     initial_cash = int(params.get('initial_cash', CASH))
     if not end_date: end_date = pd.Timestamp.now().strftime('%Y-%m-%d')
     
-    try:
-        df_raw = web.DataReader(stock_id, 'tiingo', start=start_date, end=end_date, api_key=TIINGO_API_KEY)
-        df = clean_df(df_raw.sort_index()) # 確保資料由舊到新
-        if df is None or df.empty:
-            return jsonify({"error": "無法下載或清理資料"}), 400
-    except Exception as e:
-        return jsonify({"error": f"資料下載失敗: {e}"}), 400
+    df_raw = fm.get_data(dataset="TaiwanStockPrice", data_id=stock_id.replace('.TW', ''), start_date=start_date, end_date=end_date)
+    df = clean_df_finmind(df_raw)
+    if df is None: return jsonify({"error": "無法下載或清理資料"}), 400
+    
+    df['sma_5'] = df.ta.sma(length=5, close='close')
+    df['sma_20'] = df.ta.sma(length=20, close='close')
+    if df['sma_20'].isnull().all(): return jsonify({"error": "指標計算失敗"}), 400
     
     df['signal'] = "持有"
     yesterday_sma5, yesterday_sma20 = df['sma_5'].shift(1), df['sma_20'].shift(1)
