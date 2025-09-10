@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # --- 匯入函式庫 ---
-import yfinance as yf
+import pandas_datareader.data as web
 import pandas as pd
 import pandas_ta as ta
 import os
@@ -14,6 +14,7 @@ import requests # <--- 新增 requests
 # --- 1. 全域設定與參數 ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
 API_SECRET_KEY = os.environ.get('API_SECRET_KEY', "my_super_secret_key_123_for_local_dev")
+TIINGO_API_KEY = os.environ.get('326146dea48b84b15273e001ad341085f4aa02ca')
 
 pd.set_option('display.max_columns', None)
 CASH = 1000000
@@ -184,44 +185,40 @@ def calculate_latest_signal(df):
     return signal
 
 def get_latest_price_and_signal(stock_id):
-    latest_price, latest_time, signal = None, None, "未知錯誤"
+    if not TIINGO_API_KEY:
+        return None, None, "Tiingo API 金鑰未設定"
+    
+    latest_price, latest_time = None, None
+    signal = "未知錯誤"
+
     try:
-        # --- 嘗試下載一分鐘資料 ---
-        df_latest_raw = yf.download(stock_id, period="1d", interval="1m", progress=False, session=session)
+        # Tiingo 的即時資料有 15 分鐘延遲，所以直接下載日線資料
+        # 下載最近 40 天的資料來計算 SMA
+        df_daily_raw = web.DataReader(stock_id, 'tiingo', start='2024-01-01', api_key=TIINGO_API_KEY)
         
-        # 如果一分鐘資料是空的，可能是非交易時間，嘗試下載日線資料
-        if df_latest_raw.empty:
-            print(f"⚠️ 無法下載 {stock_id} 的分鐘資料，嘗試下載日線資料...")
-            df_latest_raw = yf.download(stock_id, period="2d", interval="1d", progress=False, session=session)
-
-        df_latest = clean_df(df_latest_raw)
-        if df_latest is None or df_latest.empty:
-            print(f"❌ 無法獲取或清理 {stock_id} 的最新資料。")
-            return None, None, "無法獲取資料"
-
-        latest_price = df_latest['close'].iloc[-1]
-        latest_time = df_latest.index[-1]
+        # 由於 Tiingo 回傳的資料可能不是最新的，這裡需要額外判斷
+        # Tiingo 回傳的 DataFrame 索引是日期，且資料是最新到最舊
+        df_daily = clean_df(df_daily_raw.sort_index()) # 確保資料由舊到新
         
-        # --- 嘗試下載日線資料以計算訊號 ---
-        df_daily_raw = yf.download(stock_id, period="40d", interval="1d", progress=False, session=session)
-        df_daily = clean_df(df_daily_raw)
         if df_daily is None or df_daily.empty:
             print(f"❌ 無法獲取或清理 {stock_id} 的日線歷史資料。")
             signal = "日線資料異常"
         else:
+            latest_price = df_daily['close'].iloc[-1]
+            latest_time = df_daily.index[-1]
+            
+            # 計算 SMA 指標
             df_daily['sma_5'] = df_daily.ta.sma(length=5, close='close')
             df_daily['sma_20'] = df_daily.ta.sma(length=20, close='close')
+            
             if df_daily['sma_20'].isnull().all():
                 print(f"❌ {stock_id} 的 SMA 指標計算失敗。")
                 signal = "指標計算失敗"
             else:
                 signal = calculate_latest_signal(df_daily)
-                
+
     except Exception as e:
-        # 捕捉所有可能的錯誤，例如 JSONDecodeError 或網路錯誤
-        print(f"❌ 在下載或處理 {stock_id} 資料時發生意外錯誤: {e}")
-        # 為了除錯，列印詳細的錯誤堆疊
-        import traceback
+        print(f"❌ 在下載或處理 {stock_id} 的資料時發生意外錯誤: {e}")
         traceback.print_exc()
         signal = "下載發生錯誤"
     
@@ -503,13 +500,13 @@ def handle_backtest():
     initial_cash = int(params.get('initial_cash', CASH))
     if not end_date: end_date = pd.Timestamp.now().strftime('%Y-%m-%d')
     
-    df_raw = yf.download(stock_id, start=start_date, end=end_date, progress=False, session=session)
-    df = clean_df(df_raw)
-    if df is None: return jsonify({"error": "無法下載或清理資料"}), 400
-    
-    df['sma_5'] = df.ta.sma(length=5, close='close')
-    df['sma_20'] = df.ta.sma(length=20, close='close')
-    if df['sma_20'].isnull().all(): return jsonify({"error": "指標計算失敗"}), 400
+    try:
+        df_raw = web.DataReader(stock_id, 'tiingo', start=start_date, end=end_date, api_key=TIINGO_API_KEY)
+        df = clean_df(df_raw.sort_index()) # 確保資料由舊到新
+        if df is None or df.empty:
+            return jsonify({"error": "無法下載或清理資料"}), 400
+    except Exception as e:
+        return jsonify({"error": f"資料下載失敗: {e}"}), 400
     
     df['signal'] = "持有"
     yesterday_sma5, yesterday_sma20 = df['sma_5'].shift(1), df['sma_20'].shift(1)

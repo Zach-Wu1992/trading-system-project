@@ -2,5 +2,5 @@ Flask==3.0.3
 gunicorn==22.0.0
 pandas==2.3.2
 pandas-ta==0.4.67b0
-yfinance==0.2.40
 psycopg2-binary==2.9.9
+pandas-datareader
