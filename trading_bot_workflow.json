@@ -1,0 +1,57 @@
+{
+  "name": "每日觸發股票交易機器人",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "mode": "cron",
+          "cronExpression": "0 9-13 * * 1-5"
+        },
+        "options": {
+          "timezone": "Asia/Taipei"
+        }
+      },
+      "name": "每小時觸發 (交易日 9-13點)",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        860,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://YOUR_INTERNAL_IP:5001/api/trigger-trade-check",
+        "authentication": "headerAuth",
+        "nodeCredentialType": "httpHeaderAuth",
+        "options": {}
+      },
+      "name": "觸發交易檢查 API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "每小時觸發 (交易日 9-13點)": {
+      "main": [
+        [
+          {
+            "node": "觸發交易檢查 API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "timezone": "Asia/Taipei"
+  }
+}
+

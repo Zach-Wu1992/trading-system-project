@@ -1,208 +1,77 @@
-# 證券自動交易模擬系統 (Automated Trading Simulation System)
+證券自動交易分析平台 (雲端部署版)
+一個整合了即時模擬交易儀表板與互動式歷史回測功能的 Python Flask Web 應用，由 n8n.cloud 工作流引擎驅動，並部署在 Render 雲端平台上，使用 PostgreSQL 作為資料庫。
 
-# 這是一個基於 Python 的證券自動交易模擬系統，旨在展示一個完整後端應用程式的設計、開發與部署流程。系統包含歷史數據回測、即時模擬交易、以及一個用 Flask 建構的網頁儀表板，用於視覺化績效。
+專案預覽
+(請將此處的連結替換為您自己上傳到 GitHub 的儀表板截圖)
 
-# 
+系統架構
+本專案採用服務分離的現代雲端架構：
 
-# 主要功能
+n8n.cloud (指揮官): 使用 n8n 官方的雲端服務，定時向部署在 Render 上的 Flask 應用發送 Webhook 請求。
 
-# 歷史回測 (main.py): 載入指定時間範圍的歷史股價，並根據預設的交易策略（均線交叉）進行完整的回測，計算最終報酬率。
+Render Web Service (士兵 + 資訊官):
 
-# 
+一個運行 gunicorn 的 Python 環境，託管我們的 app.py。
 
-# 即時模擬交易 (realtime\_bot.py): 作為一個背景服務持續運行，使用 APScheduler 定時（例如每日收盤後）抓取最新股價，執行交易策略，並將交易與績效紀錄永久儲存於 SQLite 資料庫。
+提供 API 端點接收 n8n 命令，並執行交易邏輯。
 
-# 
+提供前端儀表板供使用者互動。
 
-# 視覺化儀表板 (dashboard.py): 一個基於 Flask 的 Web 應用程式，從資料庫讀取交易歷史和每日資產數據，並透過 Chart.js 將績效繪製成互動式曲線圖，同時以表格呈現詳細的交易紀錄。
+Render PostgreSQL (軍火庫):
 
-# 
+一個由 Render 提供的全託管 PostgreSQL 資料庫，用於永久儲存所有交易、績效與設定數據。
 
-# 進階交易策略: 實現了順勢加碼（Pyramiding）與固定比例停損（Stop-loss）的風控機制。
+如何在雲端部署
+第一部分：部署 Flask 應用到 Render
+準備 GitHub: 將專案（包含最新的 app.py, requirements.txt, build.sh）推送到您的 GitHub 倉庫。
 
-# 
+註冊 Render: 前往 Render.com 並用您的 GitHub 帳號註冊。
 
-# 系統架構
+建立 PostgreSQL 資料庫:
 
-# 本專案採用服務分離的架構，將「數據生產者」與「數據消費者」解耦，兩者透過共享的 SQLite 資料庫進行溝通。
+在 Render 儀表板，點擊 New + -> PostgreSQL。
 
-# 
+取一個名字（例如 trading-db），選擇 Singapore 區域，點擊 Create Database。
 
-# +------------------------+        +--------------------------+
+建立後，往下滾動到 Connections 區塊，複製 Internal Database URL，我們稍後會用到。
 
-# |                        |        |                          |
+建立 Web Service:
 
-# |  Realtime Bot          |        |  Web Dashboard (Flask)   |
+點擊 New + -> Web Service。
 
-# |  (realtime\_bot.py)     |        |  (dashboard.py)          |
+選擇您專案的 GitHub 倉庫並連接。
 
-# |  (APScheduler)         |        |                          |
+Name: trading-platform (或您喜歡的名字)
 
-# +------------------------+        +--------------------------+
+Branch: main (確保您已經將 cloud-deployment 分支合併進 main)
 
-# &nbsp;          |                                   ^
+Build Command: pip install -r requirements.txt
 
-# &nbsp;          | Writes Trades \&                   | Reads Data
+Start Command: gunicorn "app:create_app()"
 
-# &nbsp;          | Performance Data                  |
+設定環境變數:
 
-# &nbsp;          v                                   |
+點擊 Advanced，在 Environment 區塊新增三個變數：
 
-# +-------------------------------------------------------------+
+Key: PYTHON_VERSION, Value: 3.9.18
 
-# |                                                             |
+Key: DATABASE_URL, Value: (貼上您剛剛複製的 PostgreSQL 內部 URL)
 
-# |                    SQLite Database                          |
+Key: API_SECRET_KEY, Value: (設定一個您自己的、更複雜的密鑰，例如 strong_secret_from_render)
 
-# |                    (trading\_dashboard.db)                   |
+部署！: 點擊 Create Web Service。Render 會自動開始建立環境、安裝套件並啟動您的應用。完成後，您會得到一個 ...onrender.com 的公開網址。
 
-# |                                                             |
+第二部分：設定 n8n.cloud
+註冊 n8n.cloud: 前往 n8n.cloud 並註冊一個免費帳號。
 
-# +-------------------------------------------------------------+
+設定工作流:
 
-# 
+登入後，像之前一樣匯入 trading_bot_workflow.json。
 
-# 技術棧 (Technology Stack)
+設定 HTTP Header Auth 憑證，這次的 Value 要使用您在 Render 環境變數中設定的那個更安全的 API_SECRET_KEY。
 
-# 後端: Python 3.9+
+修改 HTTP Request 節點的 URL，將其改為您從 Render 拿到的公開網址，例如：https://trading-platform.onrender.com/api/trigger-trade-check
 
-# 
+啟動工作流，大功告成！
 
-# Web 框架: Flask
-
-# 
-
-# 數據獲取: yfinance
-
-# 
-
-# 數據分析: Pandas, Pandas-TA
-
-# 
-
-# 排程任務: APScheduler
-
-# 
-
-# 資料庫: SQLite3
-
-# 
-
-# 前端視覺化: Chart.js, Tailwind CSS
-
-# 
-
-# 安裝與設定
-
-# 請依照以下步驟設定您的開發環境。
-
-# 
-
-# 1\. 前置需求
-
-# 
-
-# 已安裝 Python 3.8+ 或 Anaconda。
-
-# 
-
-# 已安裝 Git。
-
-# 
-
-# 2\. Clone 專案
-
-# 
-
-# git clone \[您的 GitHub Repository 網址]
-
-# cd \[專案資料夾名稱]
-
-# 
-
-# 3\. 建立虛擬環境並安裝依賴
-
-# 建議使用 Conda 建立獨立的虛擬環境：
-
-# 
-
-# \# 建立名為 trading\_env 的 conda 環境
-
-# conda create --name trading\_env python=3.9
-
-# 
-
-# \# 啟動環境
-
-# conda activate trading\_env
-
-# 
-
-# \# 使用 requirements.txt 安裝所有必要的套件
-
-# pip install -r requirements.txt
-
-# 
-
-# 使用方式
-
-# 請在不同的終端機視窗中啟動各個服務。
-
-# 
-
-# 1\. 產生測試數據 (可選)
-
-# 若想快速查看儀表板效果，可以先執行測試數據生成器。
-
-# 
-
-# python test\_data\_generator.py
-
-# 
-
-# 2\. 啟動交易機器人 (背景服務)
-
-# 此服務會定時執行並將數據寫入 trading\_dashboard.db。
-
-# 
-
-# python realtime\_bot.py
-
-# 
-
-# 3\. 啟動 Web 儀表板
-
-# 此服務會啟動一個本地網站來顯示數據。
-
-# 
-
-# python dashboard.py
-
-# 
-
-# 啟動後，請在您的瀏覽器中開啟 http://127.0.0.1:5001 來查看儀表板。
-
-# 
-
-# 儀表板截圖
-
-<img width="2286" height="1611" alt="dashboard-screenshot" src="https://github.com/user-attachments/assets/5c03d1e3-0e94-438a-852e-074038fe5f6a" />
-
-# 
-
-# 未來可擴充方向
-
-# 容器化: 使用 Docker 與 Docker Compose 將各個服務容器化，實現一鍵啟動與標準化部署。
-
-# 
-
-# 資料庫升級: 將資料庫從 SQLite 升級為 PostgreSQL，以支援更高的併發寫入和更複雜的查詢。
-
-# 
-
-# CI/CD: 建立 GitHub Actions workflow，在程式碼提交時自動執行測試。
-
-# 
-
-# 策略優化: 將交易策略參數化，並建立更複雜的回測分析工具。
-
+此專案為面試作品，旨在展示後端系統設計與雲端部署能力。
