@@ -8,9 +8,7 @@ import traceback
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template_string, request, jsonify
-# --- ▼▼▼ 關鍵修正：使用正確的類別名稱 ▼▼▼ ---
 from FinMind.data import FinMindApi
-# --- ▲▲▲ 關鍵修正 ▲▲▲ ---
 
 # --- 1. 全域設定與參數 ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
