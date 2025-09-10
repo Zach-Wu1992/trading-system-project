@@ -1,10 +1,15 @@
-Flask==3.0.3
-pandas==2.2.2
-pandas-ta==0.3.14b0
-requests==2.32.3
-yfinance==0.2.40
-APScheduler==3.10.4
-
---- ▼▼▼ 新增的部署用套件 ▼▼▼ ---
+Flask 核心
+Flask==3.0.0
 gunicorn==22.0.0
+
+數據處理與獲取
+pandas==1.5.3
+pandas-ta==0.3.14b0
+yfinance==0.2.37
+
+資料庫
 psycopg2-binary==2.9.9
+
+其他依賴
+APScheduler==3.10.4
+requests==2.31.0
