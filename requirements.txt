@@ -1,19 +1,8 @@
-Flask 核心
 Flask==3.0.0
 gunicorn==22.0.0
-
-數據處理與獲取
 pandas==1.5.3
-
---- ▼▼▼ 關鍵修正：指定與 Python 3.9 相容的版本 ▼▼▼ ---
 pandas-ta==0.3.14b
-
---- ▲▲▲ 關鍵修正 ▲▲▲ ---
 yfinance==0.2.37
-
-資料庫
 psycopg2-binary==2.9.9
-
-其他依賴
 APScheduler==3.10.4
 requests==2.31.0
