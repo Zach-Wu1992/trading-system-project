@@ -3,133 +3,187 @@
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
-import sqlite3
 import os
 import json
 import traceback
+import psycopg2 # <--- 改用 psycopg2
+from psycopg2.extras import RealDictCursor # <--- 讓查詢結果像字典
 from flask import Flask, render_template_string, request, jsonify
 
 # --- 1. 全域設定與參數 ---
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
-DB_NAME = 'trading_system_final.db'
-API_SECRET_KEY = "my_super_secret_key_123"
+# --- ▼▼▼ 改為從環境變數讀取 ▼▼▼ ---
+DATABASE_URL = os.environ.get('DATABASE_URL')
+API_SECRET_KEY = os.environ.get('API_SECRET_KEY', "my_super_secret_key_123_for_local_dev")
+# --- ▲▲▲ 改為從環境變數讀取 ▲▲▲ ---
+
 pd.set_option('display.max_columns', None)
-# CASH 現在只作為一個全域預設值
 CASH = 1000000
 ADD_ON_SHARES = 1000
 MAX_POSITION_SHARES = 3000
 STOP_LOSS_PCT = 0.02
 
-# --- 2. 核心資料庫函式 ---
-def setup_database(conn):
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS trades (
-            trade_id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, stock_id TEXT NOT NULL,
-            action TEXT NOT NULL, shares INTEGER NOT NULL, price REAL NOT NULL,
-            total_value REAL NOT NULL, profit REAL
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS daily_performance (
-            date TEXT NOT NULL,
-            stock_id TEXT NOT NULL,
-            asset_value REAL NOT NULL,
-            PRIMARY KEY (date, stock_id)
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-    ''')
-    # 只設定預設的監控股票，初始資金改為動態獲取
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ('live_stock_id', '2308.TW'))
-    conn.commit()
+# --- 2. 核心資料庫函式 (升級為 PostgreSQL) ---
+def get_db_connection():
+    """建立 PostgreSQL 連線"""
+    if not DATABASE_URL:
+        # 在本地開發時，如果沒有設定環境變數，可以提供一個備用的本地連線字串
+        # 但為了 Render 部署，我們假設 DATABASE_URL 一定會存在
+        raise ValueError("DATABASE_URL 環境變數未設定！")
+    conn = psycopg2.connect(DATABASE_URL)
+    return conn
 
-def get_setting(conn, key):
-    cursor = conn.cursor()
-    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    result = cursor.fetchone()
-    return result[0] if result else None
+def setup_database():
+    """建立資料庫和資料表"""
+    print("🚀 正在設定 PostgreSQL 資料庫...")
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS trades (
+                    trade_id SERIAL PRIMARY KEY, timestamp TEXT NOT NULL, stock_id TEXT NOT NULL,
+                    action TEXT NOT NULL, shares INTEGER NOT NULL, price REAL NOT NULL,
+                    total_value REAL NOT NULL, profit REAL
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS daily_performance (
+                    date TEXT NOT NULL, stock_id TEXT NOT NULL,
+                    asset_value REAL NOT NULL,
+                    PRIMARY KEY (date, stock_id)
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL
+                )
+            ''')
+            # ON CONFLICT...DO NOTHING 適用於 PostgreSQL
+            cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING", ('live_stock_id', '2308.TW'))
+        conn.commit()
+        print("✅ 資料庫設定完成。")
+    except Exception as e:
+        print(f"❌ 資料庫設定失敗: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
 
-def update_setting(conn, key, value):
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-    conn.commit()
+def get_setting(key):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
+            result = cur.fetchone()
+            return result[0] if result else None
+    finally:
+        conn.close()
 
-def log_trade(conn, timestamp, stock_id, action, shares, price, profit=None):
-    cursor = conn.cursor()
-    total_value = shares * price
-    formatted_timestamp = timestamp.strftime('%Y-%m-%d %H:%M')
-    sql = 'INSERT INTO trades (timestamp, stock_id, action, shares, price, total_value, profit) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    cursor.execute(sql, (formatted_timestamp, stock_id, action, shares, price, total_value, profit))
-    conn.commit()
+def update_setting(key, value):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # ON CONFLICT...DO UPDATE 適用於 PostgreSQL
+            cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, value))
+        conn.commit()
+    finally:
+        conn.close()
 
-def log_performance(conn, date, stock_id, asset_value):
-    cursor = conn.cursor()
-    sql = 'INSERT OR REPLACE INTO daily_performance (date, stock_id, asset_value) VALUES (?, ?, ?)'
-    cursor.execute(sql, (str(date), stock_id, asset_value))
-    conn.commit()
+def log_trade(timestamp, stock_id, action, shares, price, profit=None):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            total_value = shares * price
+            formatted_timestamp = timestamp.strftime('%Y-%m-%d %H:%M')
+            sql = 'INSERT INTO trades (timestamp, stock_id, action, shares, price, total_value, profit) VALUES (%s, %s, %s, %s, %s, %s, %s)'
+            cur.execute(sql, (formatted_timestamp, stock_id, action, shares, price, total_value, profit))
+        conn.commit()
+    finally:
+        conn.close()
+        
+def log_performance(date, stock_id, asset_value):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            sql = 'INSERT INTO daily_performance (date, stock_id, asset_value) VALUES (%s, %s, %s) ON CONFLICT (date, stock_id) DO UPDATE SET asset_value = EXCLUDED.asset_value'
+            cur.execute(sql, (str(date), stock_id, asset_value))
+        conn.commit()
+    finally:
+        conn.close()
 
 # --- 3. 交易邏輯函式 ---
-def get_current_portfolio(conn, stock_id):
-    # --- ▼▼▼ 關鍵修改：獲取特定標的的初始資金 ▼▼▼ ---
-    # 我們的 key 現在是 'initial_cash_2308.TW' 這樣的格式
+def get_current_portfolio(stock_id):
     stock_specific_cash_key = f"initial_cash_{stock_id}"
-    initial_cash = int(get_setting(conn, stock_specific_cash_key) or CASH)
-    # --- ▲▲▲ 關鍵修改 ▲▲▲ ---
+    initial_cash_str = get_setting(stock_specific_cash_key)
+    initial_cash = int(initial_cash_str) if initial_cash_str else CASH
     
-    cursor = conn.cursor()
-    cursor.execute("SELECT action, shares, price FROM trades WHERE stock_id = ? AND (action = '執行買入' OR action LIKE '%賣出') ORDER BY timestamp ASC", (stock_id,))
-    trades = cursor.fetchall()
-    portfolio = {'cash': initial_cash, 'position': 0, 'avg_cost': 0}
-    for trade in trades:
-        action, shares, price = trade
-        if action == "執行買入":
-            trade_cost = price * shares
-            old_total = portfolio['avg_cost'] * portfolio['position']
-            new_total = old_total + trade_cost
-            portfolio['position'] += shares
-            portfolio['cash'] -= trade_cost
-            if portfolio['position'] > 0: portfolio['avg_cost'] = new_total / portfolio['position']
-        elif "賣出" in action:
-            portfolio['cash'] += price * shares
-            portfolio['position'] = 0
-            portfolio['avg_cost'] = 0
-    return portfolio
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT action, shares, price FROM trades WHERE stock_id = %s AND (action = '執行買入' OR action LIKE '%%賣出') ORDER BY timestamp ASC", (stock_id,))
+            trades = cur.fetchall()
+            
+        portfolio = {'cash': initial_cash, 'position': 0, 'avg_cost': 0}
+        for trade in trades:
+            if trade['action'] == "執行買入":
+                trade_cost = trade['price'] * trade['shares']
+                old_total = portfolio['avg_cost'] * portfolio['position']
+                new_total = old_total + trade_cost
+                portfolio['position'] += trade['shares']
+                portfolio['cash'] -= trade_cost
+                if portfolio['position'] > 0: portfolio['avg_cost'] = new_total / portfolio['position']
+            elif "賣出" in trade['action']:
+                portfolio['cash'] += trade['price'] * trade['shares']
+                portfolio['position'] = 0
+                portfolio['avg_cost'] = 0
+        return portfolio
+    finally:
+        conn.close()
 
-def execute_trade(conn, timestamp, signal, price, portfolio, stock_id):
+def execute_trade(timestamp, signal, price, portfolio, stock_id):
+    # (此函式邏輯不變，它呼叫的 log_trade 已經被更新)
     if signal == "買入":
-        log_trade(conn, timestamp, stock_id, "買入訊號", 0, price)
+        log_trade(timestamp, stock_id, "買入訊號", 0, price)
         if portfolio['position'] < MAX_POSITION_SHARES and \
            (portfolio['position'] == 0 or price > portfolio['avg_cost']) and \
            portfolio['cash'] >= price * ADD_ON_SHARES:
-            log_trade(conn, timestamp, stock_id, "執行買入", ADD_ON_SHARES, price)
+            log_trade(timestamp, stock_id, "執行買入", ADD_ON_SHARES, price)
             print(f"📈【執行買入】時間 {timestamp.strftime('%Y-%m-%d %H:%M')}，價格 {price:.2f}")
 
     elif signal == "賣出":
-        log_trade(conn, timestamp, stock_id, "賣出訊號", 0, price)
+        log_trade(timestamp, stock_id, "賣出訊號", 0, price)
         if portfolio['position'] > 0:
             shares_to_sell = portfolio['position']
             profit = (price - portfolio['avg_cost']) * shares_to_sell
-            log_trade(conn, timestamp, stock_id, "執行賣出", shares_to_sell, price, profit)
+            log_trade(timestamp, stock_id, "執行賣出", shares_to_sell, price, profit)
             print(f"📉【執行賣出】時間 {timestamp.strftime('%Y-%m-%d %H:%M')}，損益：{profit:,.2f}")
             
     elif signal == "持有":
-        log_trade(conn, timestamp, stock_id, "持有", 0, price)
+        log_trade(timestamp, stock_id, "持有", 0, price)
 
-def check_stop_loss(conn, timestamp, price, portfolio, stock_id):
+def check_stop_loss(timestamp, price, portfolio, stock_id):
+    # (此函式邏輯不變)
     if portfolio['position'] > 0:
         stop_loss_price = portfolio['avg_cost'] * (1 - STOP_LOSS_PCT)
         if price < stop_loss_price:
             shares_to_sell = portfolio['position']
             profit = (price - portfolio['avg_cost']) * shares_to_sell
-            log_trade(conn, timestamp, stock_id, "停損賣出", shares_to_sell, price, profit)
+            log_trade(timestamp, stock_id, "停損賣出", shares_to_sell, price, profit)
             print(f"💥【強制停損】時間 {timestamp.strftime('%Y-%m-%d %H:%M')}!")
             return True
     return False
+    
+# (其他輔助函式 clean_df, calculate_latest_signal, get_latest_price_and_signal 保持不變)
+def clean_df(df_raw):
+    if df_raw is None or df_raw.empty: return None
+    df = df_raw.copy()
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+    rename_map = {}
+    required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    for col in df.columns:
+        if str(col).capitalize() in required_cols: rename_map[col] = str(col).lower()
+    if len(rename_map) < len(required_cols): return None
+    df.rename(columns=rename_map, inplace=True)
+    df = df[['open', 'high', 'low', 'close', 'volume']]
+    return df
 
 def calculate_latest_signal(df):
     latest_data = df.iloc[-2:]
@@ -141,25 +195,9 @@ def calculate_latest_signal(df):
     elif yesterday_sma5 > yesterday_sma20 and today_sma5 < today_sma20: signal = "賣出"
     return signal
 
-def clean_df(df_raw):
-    if df_raw is None or df_raw.empty: return None
-    df = df_raw.copy()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    rename_map = {}
-    required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-    for col in df.columns:
-        if str(col).capitalize() in required_cols:
-            rename_map[col] = str(col).lower()
-    if len(rename_map) < len(required_cols): return None
-    df.rename(columns=rename_map, inplace=True)
-    df = df[['open', 'high', 'low', 'close', 'volume']]
-    return df
-    
 def get_latest_price_and_signal(stock_id):
     df_latest_raw = yf.download(stock_id, period="1d", interval="1m", progress=False)
-    if df_latest_raw.empty:
-        df_latest_raw = yf.download(stock_id, period="2d", interval="1d", progress=False)
+    if df_latest_raw.empty: df_latest_raw = yf.download(stock_id, period="2d", interval="1d", progress=False)
     df_latest = clean_df(df_latest_raw)
     if df_latest is None: return None, None, None
     latest_price = df_latest['close'].iloc[-1]
@@ -173,34 +211,36 @@ def get_latest_price_and_signal(stock_id):
     signal = calculate_latest_signal(df_daily)
     return latest_price, latest_time, signal
 
+# (run_trading_job 函式邏輯不變)
 def run_trading_job():
-    conn = sqlite3.connect(DB_NAME)
+    stock_id = get_setting('live_stock_id') or "2308.TW"
+    print(f"\n🤖 [{pd.Timestamp.now(tz='Asia/Taipei').strftime('%Y-%m-%d %H:%M:%S')}] API被觸發，開始檢查 {stock_id}...")
     try:
-        stock_id = get_setting(conn, 'live_stock_id') or "2308.TW"
-        print(f"\n🤖 [{pd.Timestamp.now(tz='Asia/Taipei').strftime('%Y-%m-%d %H:%M:%S')}] API被觸發，開始檢查 {stock_id}...")
         latest_price, latest_time, signal = get_latest_price_and_signal(stock_id)
         if latest_price is None: return {"status": "error", "message": "無法獲取最新價格資料"}
         if "失敗" in signal or "異常" in signal: return {"status": "error", "message": signal}
-        print(f"   - 最新價格 ({latest_time.strftime('%H:%M')}): {latest_price:.2f}, 日線訊號: {signal}")
-        portfolio = get_current_portfolio(conn, stock_id)
-        stop_loss_triggered = check_stop_loss(conn, latest_time, latest_price, portfolio, stock_id)
+        
+        portfolio = get_current_portfolio(stock_id)
+        
+        stop_loss_triggered = check_stop_loss(latest_time, latest_price, portfolio, stock_id)
         if not stop_loss_triggered:
-            execute_trade(conn, latest_time, signal, latest_price, portfolio, stock_id)
-        final_portfolio = get_current_portfolio(conn, stock_id)
+            execute_trade(latest_time, signal, latest_price, portfolio, stock_id)
+        
+        final_portfolio = get_current_portfolio(stock_id)
         total_asset = final_portfolio['cash'] + (final_portfolio['position'] * latest_price)
-        log_performance(conn, latest_time.date(), stock_id, total_asset)
+        log_performance(latest_time.date(), stock_id, total_asset)
+        
         message = f"檢查完成。總資產: {total_asset:,.2f}"
         return {"status": "success", "message": message}
     except Exception as e:
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
-    finally:
-        conn.close()
 
 # --- 4. Flask Web 應用 ---
 app = Flask(__name__)
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 
+# (HTML_TEMPLATE 保持不變，此處省略)
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-Hant">
@@ -233,7 +273,7 @@ HTML_TEMPLATE = """
 <body class="p-4 md:p-8">
     <div class="max-w-7xl mx-auto">
         <header class="mb-8"><h1 class="text-3xl font-bold text-white">自動交易分析平台</h1><p class="text-gray-400">整合即時監控與歷史回測功能</p></header>
-        <div class="flex space-x-4 mb-8 border-gray-700"><button id="tab-live" class="tab-button active">即時儀表板</button><button id="tab-backtest" class="tab-button">歷史回測</button></div>
+        <div class="flex space-x-4 mb-8 border-b border-gray-700"><button id="tab-live" class="tab-button active">即時儀表板</button><button id="tab-backtest" class="tab-button">歷史回測</button></div>
         <main>
             <section id="content-live" class="content-section active">
                 <section class="bg-gray-800 p-6 rounded-lg mb-8"><div class="grid grid-cols-1 md:grid-cols-3 gap-6"><div class="md:col-span-2"><h3 class="text-xl font-semibold mb-4 text-white">即時監控設定</h3>
@@ -320,7 +360,6 @@ HTML_TEMPLATE = """
             const response = await fetch('/api/settings', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                // --- ▼▼▼ 關鍵修改：將 stock_id 加入請求 ▼▼▼ ---
                 body: JSON.stringify({ key: 'initial_cash', value: newInitialCash, stock_id: currentStockId })
             });
             if(response.ok) {
@@ -371,35 +410,7 @@ HTML_TEMPLATE = """
 """
 
 # --- 5. Flask 路由與邏輯 ---
-def get_live_dashboard_data():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    stock_id = get_setting(conn, 'live_stock_id')
-    
-    # --- ▼▼▼ 關鍵修改：獲取特定標的的初始資金 ▼▼▼ ---
-    stock_specific_cash_key = f"initial_cash_{stock_id}"
-    initial_cash = get_setting(conn, stock_specific_cash_key) or CASH
-    # --- ▲▲▲ 關鍵修改 ▲▲▲ ---
-
-    trades_df = pd.read_sql_query(f"SELECT * FROM trades WHERE stock_id = ? ORDER BY timestamp DESC", conn, params=(stock_id,))
-    performance_df = pd.read_sql_query(f"SELECT * FROM daily_performance WHERE stock_id = ? ORDER BY date ASC", conn, params=(stock_id,))
-    
-    latest_price, latest_signal = "N/A", "N/A"
-    try:
-        latest_price, _, latest_signal = get_latest_price_and_signal(stock_id)
-        if latest_price is None: latest_price = "N/A"
-        if latest_signal is None: latest_signal = "N/A"
-    except Exception as e:
-        print(f"❌ 獲取儀表板即時數據時發生錯誤: {e}")
-    
-    if not performance_df.empty:
-        total_asset = performance_df['asset_value'].iloc[-1]
-    else:
-        current_portfolio = get_current_portfolio(conn, stock_id)
-        total_asset = current_portfolio['cash']
-    conn.close()
-    return {"chart_data": {'dates': performance_df['date'].tolist(),'values': performance_df['asset_value'].tolist()},"trades": trades_df.to_dict('records'),"latest_price": latest_price,"latest_signal": latest_signal,"total_asset": total_asset,"stock_id": stock_id, "initial_cash": initial_cash}
-
+# (此處的 Flask 路由與邏輯與您上一版完全相同，保持不變)
 @app.route('/')
 def dashboard():
     if not os.path.exists(DB_NAME):
@@ -408,6 +419,29 @@ def dashboard():
         conn.close()
     live_data = get_live_dashboard_data()
     return render_template_string(HTML_TEMPLATE, live_data=live_data, api_secret_key=API_SECRET_KEY)
+
+def get_live_dashboard_data():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    stock_id = get_setting(conn, 'live_stock_id')
+    stock_specific_cash_key = f"initial_cash_{stock_id}"
+    initial_cash = get_setting(conn, stock_specific_cash_key) or CASH
+    trades_df = pd.read_sql_query(f"SELECT * FROM trades WHERE stock_id = ? ORDER BY timestamp DESC", conn, params=(stock_id,))
+    performance_df = pd.read_sql_query(f"SELECT * FROM daily_performance WHERE stock_id = ? ORDER BY date ASC", conn, params=(stock_id,))
+    latest_price, latest_signal = "N/A", "N/A"
+    try:
+        latest_price, _, latest_signal = get_latest_price_and_signal(stock_id)
+        if latest_price is None: latest_price = "N/A"
+        if latest_signal is None: latest_signal = "N/A"
+    except Exception as e:
+        print(f"❌ 獲取儀表板即時數據時發生錯誤: {e}")
+    if not performance_df.empty:
+        total_asset = performance_df['asset_value'].iloc[-1]
+    else:
+        current_portfolio = get_current_portfolio(conn, stock_id)
+        total_asset = current_portfolio['cash']
+    conn.close()
+    return {"chart_data": {'dates': performance_df['date'].tolist(),'values': performance_df['asset_value'].tolist()},"trades": trades_df.to_dict('records'),"latest_price": latest_price,"latest_signal": latest_signal,"total_asset": total_asset,"stock_id": stock_id, "initial_cash": initial_cash}
 
 @app.route('/api/trigger-trade-check', methods=['POST'])
 def trigger_trade_check():
@@ -469,23 +503,18 @@ def handle_backtest():
     results = {"chart_data": {"dates": [d.strftime('%Y-%m-%d') for d in df.index],"values": daily_assets},"trades": trade_log}
     return jsonify(results)
 
-# --- ▼▼▼ 關鍵修改：更新 API 邏輯 ▼▼▼ ---
 @app.route('/api/settings', methods=['POST'])
 def update_settings_api():
     data = request.get_json()
     key, value = data.get('key'), data.get('value')
-    if not key or not value: 
-        return jsonify({"status": "error", "message": "缺少 key 或 value"}), 400
-    
-    # 根據 key 來決定要儲存的全域設定或標的特定設定
+    if not key or not value: return jsonify({"status": "error", "message": "缺少 key 或 value"}), 400
     if key == 'initial_cash':
         stock_id = data.get('stock_id')
         if not stock_id:
             return jsonify({"status": "error", "message": "更新初始資金時必須提供 stock_id"}), 400
         db_key = f"initial_cash_{stock_id}"
     else:
-        db_key = key # 例如 'live_stock_id'
-
+        db_key = key
     conn = sqlite3.connect(DB_NAME)
     try:
         update_setting(conn, db_key, value)
@@ -494,7 +523,6 @@ def update_settings_api():
         return jsonify({"status": "error", "message": str(e)}), 500
     finally:
         conn.close()
-# --- ▲▲▲ 關鍵修改 ▲▲▲ ---
 
 # --- 6. 程式主進入點 ---
 if __name__ == '__main__':
