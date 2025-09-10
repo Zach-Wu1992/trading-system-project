@@ -6,8 +6,8 @@ import pandas_ta as ta
 import os
 import json
 import traceback
-import psycopg2 # <--- 改用 psycopg2
-from psycopg2.extras import RealDictCursor # <--- 讓查詢結果像字典
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template_string, request, jsonify
 
 # --- 1. 全域設定與參數 ---
@@ -20,7 +20,7 @@ ADD_ON_SHARES = 1000
 MAX_POSITION_SHARES = 3000
 STOP_LOSS_PCT = 0.02
 
-# --- 2. 核心資料庫函式 (升級為 PostgreSQL) ---
+# --- 2. 核心資料庫函式 ---
 def get_db_connection():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL 環境變數未設定！")
@@ -211,6 +211,10 @@ def run_trading_job():
     except Exception as e:
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
+
+# --- 4. Flask Web 應用 ---
+app = Flask(__name__)
+app.config['TEMPLATES_AUTO_RELOAD'] = True
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -420,7 +424,6 @@ def get_live_dashboard_data():
     finally:
         conn.close()
 
-
 @app.route('/')
 def dashboard():
     live_data = get_live_dashboard_data()
@@ -505,16 +508,15 @@ def update_settings_api():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# --- 6. 程式主進入點 ---
-if __name__ == '__main__':
-    # 第一次啟動時，初始化資料庫
-    # 這個判斷式可以避免在 Render 每次重啟時都執行
-    if not os.environ.get('RENDER'):
-        setup_database()
-    app.run(host='0.0.0.0', port=5001, debug=True)
-
 def create_app():
     # 這個函式是給 Gunicorn 用的
-    setup_database()
+    # 第一次啟動時，初始化資料庫
+    with app.app_context():
+        setup_database()
     return app
+
+# --- 6. 程式主進入點 (僅供本地開發使用) ---
+if __name__ == '__main__':
+    setup_database()
+    app.run(host='0.0.0.0', port=5001, debug=True)
 

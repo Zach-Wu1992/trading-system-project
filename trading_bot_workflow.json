@@ -3,24 +3,28 @@
   "nodes": [
     {
       "parameters": {
-        "rule": "cron",
-        "cronTime": "0 14 * * 1-5",
+        "rule": {
+          "mode": "cron",
+          "cronExpression": "0 9-13 * * 1-5"
+        },
         "options": {
           "timezone": "Asia/Taipei"
         }
       },
-      "name": "每日下午2點 (週一至五)",
+      "name": "每小時觸發 (交易日 9-13點)",
       "type": "n8n-nodes-base.cron",
       "typeVersion": 1,
       "position": [
         860,
-        380
+        300
       ]
     },
     {
       "parameters": {
-        "url": "http://192.168.1.100:5001/api/trigger-trade-check",
+        "method": "POST",
+        "url": "http://YOUR_INTERNAL_IP:5001/api/trigger-trade-check",
         "authentication": "headerAuth",
+        "nodeCredentialType": "httpHeaderAuth",
         "options": {}
       },
       "name": "觸發交易檢查 API",
@@ -28,18 +32,12 @@
       "typeVersion": 2,
       "position": [
         1100,
-        380
-      ],
-      "credentials": {
-        "httpHeaderAuth": {
-          "id": "1",
-          "name": "交易機器人 API 金鑰"
-        }
-      }
+        300
+      ]
     }
   ],
   "connections": {
-    "每日下午2點 (週一至五)": {
+    "每小時觸發 (交易日 9-13點)": {
       "main": [
         [
           {
@@ -50,5 +48,10 @@
         ]
       ]
     }
+  },
+  "active": false,
+  "settings": {
+    "timezone": "Asia/Taipei"
   }
 }
+
