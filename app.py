@@ -8,9 +8,12 @@ import traceback
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template_string, request, jsonify
-from FinMind.data import FinMindApi # <--- 使用 FinMind
+from FinMind.data import FinMindApi
+import logging
 
 # --- 1. 全域設定與參數 ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 DATABASE_URL = os.environ.get('DATABASE_URL')
 API_SECRET_KEY = os.environ.get('API_SECRET_KEY')
 FINMIND_API_TOKEN = os.environ.get('FINMIND_API_TOKEN')
@@ -26,12 +29,12 @@ fm = None
 if FINMIND_API_TOKEN:
     try:
         fm = FinMindApi()
-        fm.login_by_token(FINMIND_API_TOKEN)
-        print("✅ FinMind API 客戶端初始化成功。")
+        fm.login(api_token=FINMIND_API_TOKEN)
+        logging.info("✅ FinMind API 客戶端初始化成功。")
     except Exception as e:
-        print(f"❌ FinMind 登入失敗: {e}")
+        logging.error(f"❌ FinMind 登入失敗: {e}")
 else:
-    print("⚠️ 警告：未設定 FINMIND_API_TOKEN 環境變數。")
+    logging.warning("⚠️ 警告：未設定 FINMIND_API_TOKEN 環境變數。")
 
 # --- 2. 核心資料庫函式 (PostgreSQL 版) ---
 def get_db_connection():
@@ -40,7 +43,7 @@ def get_db_connection():
     return conn
 
 def setup_database():
-    print("🚀 正在設定 PostgreSQL 資料庫...")
+    logging.info("🚀 正在設定 PostgreSQL 資料庫...")
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -66,9 +69,9 @@ def setup_database():
             ''')
             cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING", ('live_stock_id', '2308.TW'))
         conn.commit()
-        print("✅ 資料庫設定完成。")
+        logging.info("✅ 資料庫設定完成。")
     except Exception as e:
-        print(f"❌ 資料庫設定失敗: {e}")
+        logging.error(f"❌ 資料庫設定失敗: {e}")
         conn.rollback()
     finally:
         conn.close()
@@ -87,11 +90,7 @@ def update_setting(key, value):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # --- 修改開始: 確保傳入資料庫的值是 Python 原生的 str 型別 ---
-            native_key = str(key)
-            native_value = str(value)
-            # --- 修改結束 ---
-            cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (native_key, native_value))
+            cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, value))
         conn.commit()
     finally:
         conn.close()
@@ -100,19 +99,16 @@ def log_trade(timestamp, stock_id, action, shares, price, profit=None):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # --- 修改開始: 確保傳入資料庫的是 Python 原生型別 ---
-            native_shares = int(shares)
-            native_price = float(price)
-            # profit 可能為 None，需要額外處理
-            native_profit = float(profit) if profit is not None else None
-            total_value = native_shares * native_price
-            # --- 修改結束 ---
+            py_shares = int(shares)
+            py_price = float(price)
+            py_total_value = py_shares * py_price
+            py_profit = float(profit) if profit is not None else None
             
+            # --- ▼▼▼ 關鍵修改：使用傳入的 timezone-aware timestamp 進行格式化 ▼▼▼ ---
             formatted_timestamp = timestamp.strftime('%Y-%m-%d %H:%M')
+            # --- ▲▲▲ 關鍵修改 ▲▲▲ ---
             sql = 'INSERT INTO trades (timestamp, stock_id, action, shares, price, total_value, profit) VALUES (%s, %s, %s, %s, %s, %s, %s)'
-            
-            # 使用轉換後的原生型別變數
-            cur.execute(sql, (formatted_timestamp, stock_id, action, native_shares, native_price, total_value, native_profit))
+            cur.execute(sql, (formatted_timestamp, stock_id, action, py_shares, py_price, py_total_value, py_profit))
         conn.commit()
     finally:
         conn.close()
@@ -121,13 +117,9 @@ def log_performance(date, stock_id, asset_value):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # --- 修改開始: 確保 asset_value 是 Python 原生的 float 型別 ---
-            native_asset_value = float(asset_value)
-            # --- 修改結束 ---
+            py_asset_value = float(asset_value)
             sql = 'INSERT INTO daily_performance (date, stock_id, asset_value) VALUES (%s, %s, %s) ON CONFLICT (date, stock_id) DO UPDATE SET asset_value = EXCLUDED.asset_value'
-            
-            # 使用轉換後的原生型別變數
-            cur.execute(sql, (str(date), stock_id, native_asset_value))
+            cur.execute(sql, (str(date), stock_id, py_asset_value))
         conn.commit()
     finally:
         conn.close()
@@ -145,14 +137,14 @@ def get_current_portfolio(stock_id):
         portfolio = {'cash': initial_cash, 'position': 0, 'avg_cost': 0}
         for trade in trades:
             if trade['action'] == "執行買入":
-                trade_cost = trade['price'] * trade['shares']
+                trade_cost = float(trade['price']) * int(trade['shares'])
                 old_total = portfolio['avg_cost'] * portfolio['position']
                 new_total = old_total + trade_cost
-                portfolio['position'] += trade['shares']
+                portfolio['position'] += int(trade['shares'])
                 portfolio['cash'] -= trade_cost
                 if portfolio['position'] > 0: portfolio['avg_cost'] = new_total / portfolio['position']
             elif "賣出" in trade['action']:
-                portfolio['cash'] += trade['price'] * trade['shares']
+                portfolio['cash'] += float(trade['price']) * int(trade['shares'])
                 portfolio['position'] = 0
                 portfolio['avg_cost'] = 0
         return portfolio
@@ -164,12 +156,14 @@ def execute_trade(timestamp, signal, price, portfolio, stock_id):
         log_trade(timestamp, stock_id, "買入訊號", 0, price)
         if portfolio['position'] < MAX_POSITION_SHARES and (portfolio['position'] == 0 or price > portfolio['avg_cost']) and portfolio['cash'] >= price * ADD_ON_SHARES:
             log_trade(timestamp, stock_id, "執行買入", ADD_ON_SHARES, price)
+            logging.info(f"📈【執行買入】時間 {timestamp.strftime('%Y-%m-%d %H:%M')}，價格 {price:.2f}")
     elif signal == "賣出":
         log_trade(timestamp, stock_id, "賣出訊號", 0, price)
         if portfolio['position'] > 0:
             shares_to_sell = portfolio['position']
             profit = (price - portfolio['avg_cost']) * shares_to_sell
             log_trade(timestamp, stock_id, "執行賣出", shares_to_sell, price, profit)
+            logging.info(f"📉【執行賣出】時間 {timestamp.strftime('%Y-%m-%d %H:%M')}，損益：{profit:,.2f}")
     elif signal == "持有":
         log_trade(timestamp, stock_id, "持有", 0, price)
 
@@ -180,6 +174,7 @@ def check_stop_loss(timestamp, price, portfolio, stock_id):
             shares_to_sell = portfolio['position']
             profit = (price - portfolio['avg_cost']) * shares_to_sell
             log_trade(timestamp, stock_id, "停損賣出", shares_to_sell, price, profit)
+            logging.warning(f"💥【強制停損】時間 {timestamp.strftime('%Y-%m-%d %H:%M')}!")
             return True
     return False
 
@@ -191,7 +186,7 @@ def clean_df_finmind(df_raw):
     df.set_index('date', inplace=True)
     required_cols = ['open', 'high', 'low', 'close', 'volume']
     if not all(col in df.columns for col in required_cols):
-        print(f"❌ FinMind 資料清理失敗：缺少必要欄位. 現有: {df.columns.tolist()}")
+        logging.error(f"❌ FinMind 資料清理失敗：缺少必要欄位. 現有: {df.columns.tolist()}")
         return None
     return df
 
@@ -221,22 +216,40 @@ def get_latest_price_and_signal(stock_id):
     return latest_price, latest_time, signal
 
 def run_trading_job():
+    # --- ▼▼▼ 關鍵修改：獲取當前台北時間作為檢查時間戳 ▼▼▼ ---
+    check_timestamp = pd.Timestamp.now(tz='Asia/Taipei')
+    # --- ▲▲▲ 關鍵修改 ▲▲▲ ---
+    
     stock_id = get_setting('live_stock_id') or "2308.TW"
     try:
-        latest_price, latest_time, signal = get_latest_price_and_signal(stock_id)
+        logging.info(f"🤖 API被觸發，開始檢查 {stock_id} at {check_timestamp.strftime('%Y-%m-%d %H:%M:%S')}...")
+        
+        # 我們只用 data_timestamp 來代表數據本身的日期，用於計算
+        latest_price, data_timestamp, signal = get_latest_price_and_signal(stock_id)
+
         if latest_price is None: return {"status": "error", "message": "無法獲取最新價格資料"}
         if "失敗" in signal or "異常" in signal: return {"status": "error", "message": signal}
+        
+        logging.info(f"   - 最新價格 ({data_timestamp.date()}): {latest_price:.2f}, 日線訊號: {signal}")
+        
         portfolio = get_current_portfolio(stock_id)
-        stop_loss_triggered = check_stop_loss(latest_time, latest_price, portfolio, stock_id)
+        
+        # --- ▼▼▼ 關鍵修改：使用 check_timestamp 進行日誌記錄 ▼▼▼ ---
+        stop_loss_triggered = check_stop_loss(check_timestamp, latest_price, portfolio, stock_id)
         if not stop_loss_triggered:
-            execute_trade(latest_time, signal, latest_price, portfolio, stock_id)
+            execute_trade(check_timestamp, signal, latest_price, portfolio, stock_id)
+        
         final_portfolio = get_current_portfolio(stock_id)
-        total_asset = final_portfolio['cash'] + (final_portfolio['position'] * latest_price)
-        log_performance(latest_time.date(), stock_id, total_asset)
+        total_asset = final_portfolio['cash'] + (final_portfolio['position'] * float(latest_price))
+        log_performance(check_timestamp.date(), stock_id, total_asset)
+        # --- ▲▲▲ 關鍵修改 ▲▲▲ ---
+
         message = f"檢查完成。總資產: {total_asset:,.2f}"
+        logging.info(f"   {message}")
         return {"status": "success", "message": message}
     except Exception as e:
-        traceback.print_exc()
+        logging.error(f"❌ 執行交易任務時發生未預期錯誤: {e}")
+        logging.error(traceback.format_exc())
         return {"status": "error", "message": str(e)}
 
 # --- 4. Flask Web 應用 ---
@@ -462,64 +475,71 @@ def dashboard():
 @app.route('/api/trigger-trade-check', methods=['POST'])
 def trigger_trade_check():
     auth_header = request.headers.get('Authorization')
-    if auth_header != f"Bearer {API_SECRET_KEY}": return jsonify({"status": "error", "message": "未經授權"}), 401
+    if auth_header != f"Bearer {API_SECRET_KEY}":
+        logging.warning("收到未經授權的 API 請求")
+        return jsonify({"status": "error", "message": "未經授權"}), 401
     result = run_trading_job()
     if result.get('status') == 'success': return jsonify(result), 200
     else: return jsonify(result), 500
 
 @app.route('/api/run-backtest', methods=['POST'])
 def handle_backtest():
-    params = request.get_json()
-    stock_id, start_date = params.get('stock_id', '2330.TW'), params.get('start_date', '2024-01-01')
-    end_date = params.get('end_date') or pd.Timestamp.now().strftime('%Y-%m-%d')
-    initial_cash = int(params.get('initial_cash', CASH))
-    if not end_date: end_date = pd.Timestamp.now().strftime('%Y-%m-%d')
-    
-    if not fm: return jsonify({"error": "FinMind 未初始化，請檢查 API Token"}), 500
-    
-    df_raw = fm.get_data(dataset="TaiwanStockPrice", data_id=stock_id.replace('.TW', ''), start_date=start_date, end_date=end_date)
-    df = clean_df_finmind(df_raw)
-    if df is None: return jsonify({"error": "無法下載或清理資料"}), 400
-    
-    df['sma_5'] = df.ta.sma(length=5, close='close')
-    df['sma_20'] = df.ta.sma(length=20, close='close')
-    if df['sma_20'].isnull().all(): return jsonify({"error": "指標計算失敗"}), 400
-    
-    df['signal'] = "持有"
-    yesterday_sma5, yesterday_sma20 = df['sma_5'].shift(1), df['sma_20'].shift(1)
-    buy_conditions = (df['sma_5'] > df['sma_20']) & (yesterday_sma5 < yesterday_sma20)
-    sell_conditions = (df['sma_5'] < df['sma_20']) & (yesterday_sma5 > yesterday_sma20)
-    df.loc[buy_conditions, 'signal'] = "買入"
-    df.loc[sell_conditions, 'signal'] = "賣出"
-    
-    backtest_portfolio = {'cash': initial_cash, 'position': 0, 'avg_cost': 0}
-    daily_assets, trade_log = [], []
-    for index, row in df.iterrows():
-        price, signal = row['close'], row['signal']
-        if backtest_portfolio['position'] > 0:
-            stop_loss_price = backtest_portfolio['avg_cost'] * (1 - STOP_LOSS_PCT)
-            if price < stop_loss_price:
+    try:
+        params = request.get_json()
+        stock_id, start_date = params.get('stock_id', '2330.TW'), params.get('start_date', '2024-01-01')
+        end_date = params.get('end_date') or pd.Timestamp.now().strftime('%Y-%m-%d')
+        initial_cash = int(params.get('initial_cash', CASH))
+        if not end_date: end_date = pd.Timestamp.now().strftime('%Y-%m-%d')
+        
+        if not fm: return jsonify({"error": "FinMind 未初始化，請檢查 API Token"}), 500
+        
+        df_raw = fm.get_data(dataset="TaiwanStockPrice", data_id=stock_id.replace('.TW', ''), start_date=start_date, end_date=end_date)
+        df = clean_df_finmind(df_raw)
+        if df is None: return jsonify({"error": "無法下載或清理資料"}), 400
+        
+        df['sma_5'] = df.ta.sma(length=5, close='close')
+        df['sma_20'] = df.ta.sma(length=20, close='close')
+        if df['sma_20'].isnull().all(): return jsonify({"error": "指標計算失敗"}), 400
+        
+        df['signal'] = "持有"
+        yesterday_sma5, yesterday_sma20 = df['sma_5'].shift(1), df['sma_20'].shift(1)
+        buy_conditions = (df['sma_5'] > df['sma_20']) & (yesterday_sma5 < yesterday_sma20)
+        sell_conditions = (df['sma_5'] < df['sma_20']) & (yesterday_sma5 > yesterday_sma20)
+        df.loc[buy_conditions, 'signal'] = "買入"
+        df.loc[sell_conditions, 'signal'] = "賣出"
+        
+        backtest_portfolio = {'cash': initial_cash, 'position': 0, 'avg_cost': 0}
+        daily_assets, trade_log = [], []
+        for index, row in df.iterrows():
+            price, signal = row['close'], row['signal']
+            if backtest_portfolio['position'] > 0:
+                stop_loss_price = backtest_portfolio['avg_cost'] * (1 - STOP_LOSS_PCT)
+                if price < stop_loss_price:
+                    profit = (price - backtest_portfolio['avg_cost']) * backtest_portfolio['position']
+                    trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '停損賣出', 'shares': backtest_portfolio['position'], 'price': price, 'total_value': price * backtest_portfolio['position'], 'profit': profit})
+                    backtest_portfolio['cash'] += price * backtest_portfolio['position']
+                    backtest_portfolio['position'], backtest_portfolio['avg_cost'] = 0, 0
+            if signal == "買入" and backtest_portfolio['position'] < MAX_POSITION_SHARES:
+                if backtest_portfolio['position'] == 0 or price > backtest_portfolio['avg_cost']:
+                    if backtest_portfolio['cash'] >= price * ADD_ON_SHARES:
+                        old_total = backtest_portfolio['avg_cost'] * backtest_portfolio['position']
+                        new_total = old_total + (price * ADD_ON_SHARES)
+                        backtest_portfolio['position'] += ADD_ON_SHARES
+                        backtest_portfolio['cash'] -= price * ADD_ON_SHARES
+                        backtest_portfolio['avg_cost'] = new_total / backtest_portfolio['position']
+                        trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '執行買入', 'shares': ADD_ON_SHARES, 'price': price, 'total_value': price * ADD_ON_SHARES, 'profit': None})
+            elif signal == "賣出" and backtest_portfolio['position'] > 0:
                 profit = (price - backtest_portfolio['avg_cost']) * backtest_portfolio['position']
-                trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '停損賣出', 'shares': backtest_portfolio['position'], 'price': price, 'total_value': price * backtest_portfolio['position'], 'profit': profit})
+                trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '執行賣出', 'shares': backtest_portfolio['position'], 'price': price, 'total_value': price * backtest_portfolio['position'], 'profit': profit})
                 backtest_portfolio['cash'] += price * backtest_portfolio['position']
                 backtest_portfolio['position'], backtest_portfolio['avg_cost'] = 0, 0
-        if signal == "買入" and backtest_portfolio['position'] < MAX_POSITION_SHARES:
-            if backtest_portfolio['position'] == 0 or price > backtest_portfolio['avg_cost']:
-                if backtest_portfolio['cash'] >= price * ADD_ON_SHARES:
-                    old_total = backtest_portfolio['avg_cost'] * backtest_portfolio['position']
-                    new_total = old_total + (price * ADD_ON_SHARES)
-                    backtest_portfolio['position'] += ADD_ON_SHARES
-                    backtest_portfolio['cash'] -= price * ADD_ON_SHARES
-                    backtest_portfolio['avg_cost'] = new_total / backtest_portfolio['position']
-                    trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '買入', 'shares': ADD_ON_SHARES, 'price': price, 'total_value': price * ADD_ON_SHARES, 'profit': None})
-        elif signal == "賣出" and backtest_portfolio['position'] > 0:
-            profit = (price - backtest_portfolio['avg_cost']) * backtest_portfolio['position']
-            trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '訊號賣出', 'shares': backtest_portfolio['position'], 'price': price, 'total_value': price * backtest_portfolio['position'], 'profit': profit})
-            backtest_portfolio['cash'] += price * backtest_portfolio['position']
-            backtest_portfolio['position'], backtest_portfolio['avg_cost'] = 0, 0
-        daily_assets.append(backtest_portfolio['cash'] + (backtest_portfolio['position'] * price))
-    results = {"chart_data": {"dates": [d.strftime('%Y-%m-%d') for d in df.index],"values": daily_assets},"trades": trade_log}
-    return jsonify(results)
+            daily_assets.append(backtest_portfolio['cash'] + (backtest_portfolio['position'] * price))
+        results = {"chart_data": {"dates": [d.strftime('%Y-%m-%d') for d in df.index],"values": daily_assets},"trades": trade_log}
+        return jsonify(results)
+    except Exception as e:
+        logging.error(f"回測 API 發生錯誤: {e}")
+        logging.error(traceback.format_exc())
+        return jsonify({"error": "回測時發生內部錯誤"}), 500
 
 @app.route('/api/settings', methods=['POST'])
 def update_settings_api():
@@ -528,8 +548,7 @@ def update_settings_api():
     if not key or not value: return jsonify({"status": "error", "message": "缺少 key 或 value"}), 400
     if key == 'initial_cash':
         stock_id = data.get('stock_id')
-        if not stock_id:
-            return jsonify({"status": "error", "message": "更新初始資金時必須提供 stock_id"}), 400
+        if not stock_id: return jsonify({"status": "error", "message": "更新初始資金時必須提供 stock_id"}), 400
         db_key = f"initial_cash_{stock_id}"
     else:
         db_key = key
@@ -537,15 +556,17 @@ def update_settings_api():
         update_setting(db_key, value)
         return jsonify({"status": "success", "message": f"設定 {db_key} 已更新為 {value}"}), 200
     except Exception as e:
+        logging.error(f"更新設定 API 發生錯誤: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 def create_app():
-    # 這個函式是給 Gunicorn 用的
     with app.app_context():
         setup_database()
     return app
 
-# --- 6. 程式主進入點 (僅供本地開發使用) ---
 if __name__ == '__main__':
-    setup_database()
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    if not DATABASE_URL:
+        logging.error("❌ 錯誤：未設定 DATABASE_URL 環境變數，無法在本地啟動。")
+    else:
+        setup_database()
+        app.run(host='0.0.0.0', port=5001, debug=True)
