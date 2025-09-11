@@ -87,7 +87,11 @@ def update_setting(key, value):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, value))
+            # --- 修改開始: 確保傳入資料庫的值是 Python 原生的 str 型別 ---
+            native_key = str(key)
+            native_value = str(value)
+            # --- 修改結束 ---
+            cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (native_key, native_value))
         conn.commit()
     finally:
         conn.close()
@@ -96,10 +100,19 @@ def log_trade(timestamp, stock_id, action, shares, price, profit=None):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            total_value = shares * price
+            # --- 修改開始: 確保傳入資料庫的是 Python 原生型別 ---
+            native_shares = int(shares)
+            native_price = float(price)
+            # profit 可能為 None，需要額外處理
+            native_profit = float(profit) if profit is not None else None
+            total_value = native_shares * native_price
+            # --- 修改結束 ---
+            
             formatted_timestamp = timestamp.strftime('%Y-%m-%d %H:%M')
             sql = 'INSERT INTO trades (timestamp, stock_id, action, shares, price, total_value, profit) VALUES (%s, %s, %s, %s, %s, %s, %s)'
-            cur.execute(sql, (formatted_timestamp, stock_id, action, shares, price, total_value, profit))
+            
+            # 使用轉換後的原生型別變數
+            cur.execute(sql, (formatted_timestamp, stock_id, action, native_shares, native_price, total_value, native_profit))
         conn.commit()
     finally:
         conn.close()
@@ -108,8 +121,13 @@ def log_performance(date, stock_id, asset_value):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+            # --- 修改開始: 確保 asset_value 是 Python 原生的 float 型別 ---
+            native_asset_value = float(asset_value)
+            # --- 修改結束 ---
             sql = 'INSERT INTO daily_performance (date, stock_id, asset_value) VALUES (%s, %s, %s) ON CONFLICT (date, stock_id) DO UPDATE SET asset_value = EXCLUDED.asset_value'
-            cur.execute(sql, (str(date), stock_id, asset_value))
+            
+            # 使用轉換後的原生型別變數
+            cur.execute(sql, (str(date), stock_id, native_asset_value))
         conn.commit()
     finally:
         conn.close()
@@ -530,6 +548,4 @@ def create_app():
 # --- 6. 程式主進入點 (僅供本地開發使用) ---
 if __name__ == '__main__':
     setup_database()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
-
+    app.run(host='0.0.0.0', port=5001, debug=True)
