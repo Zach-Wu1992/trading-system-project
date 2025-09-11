@@ -25,7 +25,8 @@ STOP_LOSS_PCT = 0.02
 fm = None
 if FINMIND_API_TOKEN:
     try:
-        fm = FinMindApi(api_token=FINMIND_API_TOKEN)
+        fm = FinMindApi()
+        fm.login_by_token(FINMIND_API_TOKEN)
         print("✅ FinMind API 客戶端初始化成功。")
     except Exception as e:
         print(f"❌ FinMind 登入失敗: {e}")
