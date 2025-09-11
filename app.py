@@ -530,5 +530,6 @@ def create_app():
 # --- 6. 程式主進入點 (僅供本地開發使用) ---
 if __name__ == '__main__':
     setup_database()
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
 
