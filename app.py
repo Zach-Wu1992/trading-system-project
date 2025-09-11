@@ -1,18 +1,19 @@
 # -*- coding: utf-8 -*-
 # --- 匯入函式庫 ---
-import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
 import os
 import json
 import traceback
-import psycopg2 # <--- 改用 psycopg2
-from psycopg2.extras import RealDictCursor # <--- 讓查詢結果像字典
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template_string, request, jsonify
+from FinMind.data import FinMindApi # <--- 使用 FinMind
 
 # --- 1. 全域設定與參數 ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
-API_SECRET_KEY = os.environ.get('API_SECRET_KEY', "my_super_secret_key_123_for_local_dev")
+API_SECRET_KEY = os.environ.get('API_SECRET_KEY')
+FINMIND_API_TOKEN = os.environ.get('FINMIND_API_TOKEN')
 
 pd.set_option('display.max_columns', None)
 CASH = 1000000
@@ -20,16 +21,25 @@ ADD_ON_SHARES = 1000
 MAX_POSITION_SHARES = 3000
 STOP_LOSS_PCT = 0.02
 
-# --- 2. 核心資料庫函式 (升級為 PostgreSQL) ---
+# --- 初始化 FinMind API 客戶端 ---
+fm = None
+if FINMIND_API_TOKEN:
+    try:
+        fm = FinMindApi()
+        fm.login(api_token=FINMIND_API_TOKEN)
+        print("✅ FinMind API 客戶端初始化成功。")
+    except Exception as e:
+        print(f"❌ FinMind 登入失敗: {e}")
+else:
+    print("⚠️ 警告：未設定 FINMIND_API_TOKEN 環境變數。")
+
+# --- 2. 核心資料庫函式 (PostgreSQL 版) ---
 def get_db_connection():
-    """建立 PostgreSQL 連線"""
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL 環境變數未設定！")
+    if not DATABASE_URL: raise ValueError("DATABASE_URL 環境變數未設定！")
     conn = psycopg2.connect(DATABASE_URL)
     return conn
 
 def setup_database():
-    """建立資料庫和資料表"""
     print("🚀 正在設定 PostgreSQL 資料庫...")
     conn = get_db_connection()
     try:
@@ -43,7 +53,8 @@ def setup_database():
             ''')
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS daily_performance (
-                    date TEXT NOT NULL, stock_id TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    stock_id TEXT NOT NULL,
                     asset_value REAL NOT NULL,
                     PRIMARY KEY (date, stock_id)
                 )
@@ -108,13 +119,11 @@ def get_current_portfolio(stock_id):
     stock_specific_cash_key = f"initial_cash_{stock_id}"
     initial_cash_str = get_setting(stock_specific_cash_key)
     initial_cash = int(initial_cash_str) if initial_cash_str else CASH
-    
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT action, shares, price FROM trades WHERE stock_id = %s AND (action = '執行買入' OR action LIKE '%%賣出') ORDER BY timestamp ASC", (stock_id,))
             trades = cur.fetchall()
-            
         portfolio = {'cash': initial_cash, 'position': 0, 'avg_cost': 0}
         for trade in trades:
             if trade['action'] == "執行買入":
@@ -156,17 +165,16 @@ def check_stop_loss(timestamp, price, portfolio, stock_id):
             return True
     return False
 
-def clean_df(df_raw):
+def clean_df_finmind(df_raw):
     if df_raw is None or df_raw.empty: return None
     df = df_raw.copy()
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-    rename_map = {}
-    required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-    for col in df.columns:
-        if str(col).capitalize() in required_cols: rename_map[col] = str(col).lower()
-    if len(rename_map) < len(required_cols): return None
-    df.rename(columns=rename_map, inplace=True)
-    df = df[['open', 'high', 'low', 'close', 'volume']]
+    df.rename(columns={'max': 'high', 'min': 'low', 'Trading_Volume': 'volume'}, inplace=True)
+    df['date'] = pd.to_datetime(df['date'])
+    df.set_index('date', inplace=True)
+    required_cols = ['open', 'high', 'low', 'close', 'volume']
+    if not all(col in df.columns for col in required_cols):
+        print(f"❌ FinMind 資料清理失敗：缺少必要欄位. 現有: {df.columns.tolist()}")
+        return None
     return df
 
 def calculate_latest_signal(df):
@@ -180,15 +188,14 @@ def calculate_latest_signal(df):
     return signal
 
 def get_latest_price_and_signal(stock_id):
-    df_latest_raw = yf.download(stock_id, period="1d", interval="1m", progress=False)
-    if df_latest_raw.empty: df_latest_raw = yf.download(stock_id, period="2d", interval="1d", progress=False)
-    df_latest = clean_df(df_latest_raw)
-    if df_latest is None: return None, None, None
-    latest_price = df_latest['close'].iloc[-1]
-    latest_time = df_latest.index[-1]
-    df_daily_raw = yf.download(stock_id, period="40d", interval="1d", progress=False)
-    df_daily = clean_df(df_daily_raw)
-    if df_daily is None: return latest_price, latest_time, "日線資料異常"
+    if not fm: return None, None, "FinMind 未初始化"
+    end_date = pd.Timestamp.now().strftime('%Y-%m-%d')
+    start_date = (pd.Timestamp.now() - pd.DateOffset(days=60)).strftime('%Y-%m-%d')
+    df_daily_raw = fm.get_data(dataset="TaiwanStockPrice", data_id=stock_id.replace('.TW', ''), start_date=start_date, end_date=end_date)
+    df_daily = clean_df_finmind(df_daily_raw)
+    if df_daily is None: return None, None, "日線資料獲取或清理失敗"
+    latest_price = df_daily['close'].iloc[-1]
+    latest_time = df_daily.index[-1]
     df_daily['sma_5'] = df_daily.ta.sma(length=5, close='close')
     df_daily['sma_20'] = df_daily.ta.sma(length=20, close='close')
     if df_daily['sma_20'].isnull().all(): return latest_price, latest_time, "指標計算失敗"
@@ -216,8 +223,6 @@ def run_trading_job():
 
 # --- 4. Flask Web 應用 ---
 app = Flask(__name__)
-app.config['TEMPLATES_AUTO_RELOAD'] = True
-
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-Hant">
