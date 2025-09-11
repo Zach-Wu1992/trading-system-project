@@ -30,10 +30,10 @@ fm = None
 if FINMIND_API_TOKEN:
     try:
         fm = FinMindApi()
-        fm.login(api_token=FINMIND_API_TOKEN)
-        logging.info("✅ FinMind API 客戶端初始化成功。")
+        fm.login_by_token(FINMIND_API_TOKEN)
+        print("✅ FinMind API 客戶端初始化成功")
     except Exception as e:
-        logging.error(f"❌ FinMind 登入失敗: {e}")
+        print(f"❌ FinMind 登入失敗: {e}")
 else:
     logging.warning("⚠️ 警告：未設定 FINMIND_API_TOKEN 環境變數。")
 
