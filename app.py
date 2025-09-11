@@ -10,6 +10,7 @@ from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template_string, request, jsonify
 from FinMind.data import FinMindApi
 import logging
+from datetime import datetime
 
 # --- 1. 全域設定與參數 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -104,9 +105,7 @@ def log_trade(timestamp, stock_id, action, shares, price, profit=None):
             py_total_value = py_shares * py_price
             py_profit = float(profit) if profit is not None else None
             
-            # --- ▼▼▼ 關鍵修改：使用傳入的 timezone-aware timestamp 進行格式化 ▼▼▼ ---
             formatted_timestamp = timestamp.strftime('%Y-%m-%d %H:%M')
-            # --- ▲▲▲ 關鍵修改 ▲▲▲ ---
             sql = 'INSERT INTO trades (timestamp, stock_id, action, shares, price, total_value, profit) VALUES (%s, %s, %s, %s, %s, %s, %s)'
             cur.execute(sql, (formatted_timestamp, stock_id, action, py_shares, py_price, py_total_value, py_profit))
         conn.commit()
@@ -200,41 +199,61 @@ def calculate_latest_signal(df):
     elif yesterday_sma5 > yesterday_sma20 and today_sma5 < today_sma20: signal = "賣出"
     return signal
 
+# --- ▼▼▼ 關鍵修改：獲取資料的邏輯升級 ▼▼▼ ---
 def get_latest_price_and_signal(stock_id):
     if not fm: return None, None, "FinMind 未初始化"
-    end_date = pd.Timestamp.now().strftime('%Y-%m-%d')
-    start_date = (pd.Timestamp.now() - pd.DateOffset(days=60)).strftime('%Y-%m-%d')
-    df_daily_raw = fm.get_data(dataset="TaiwanStockPrice", data_id=stock_id.replace('.TW', ''), start_date=start_date, end_date=end_date)
+    
+    today_str = pd.Timestamp.now(tz='Asia/Taipei').strftime('%Y-%m-%d')
+    stock_id_clean = stock_id.replace('.TW', '')
+
+    # 步驟 1: 獲取最新即時價格
+    latest_price = None
+    latest_time = pd.Timestamp.now(tz='Asia/Taipei') # 預設為當前時間
+    try:
+        df_tick_raw = fm.get_data(dataset="TaiwanStockPriceTick", data_id=stock_id_clean, start_date=today_str)
+        if not df_tick_raw.empty:
+            latest_price = df_tick_raw['deal_price'].iloc[-1]
+            # 將時間字串轉換為 pandas 的 Timestamp 物件
+            latest_time_str = f"{df_tick_raw['date'].iloc[-1]} {df_tick_raw['time'].iloc[-1]}"
+            latest_time = pd.to_datetime(latest_time_str).tz_localize('Asia/Taipei')
+    except Exception as e:
+        logging.warning(f"⚠️ 獲取即時 Tick 資料失敗: {e}")
+
+    # 步驟 2: 獲取日線資料來計算訊號
+    start_date_daily = (pd.Timestamp.now() - pd.DateOffset(days=60)).strftime('%Y-%m-%d')
+    df_daily_raw = fm.get_data(dataset="TaiwanStockPrice", data_id=stock_id_clean, start_date=start_date_daily, end_date=today_str)
     df_daily = clean_df_finmind(df_daily_raw)
-    if df_daily is None: return None, None, "日線資料獲取或清理失敗"
-    latest_price = df_daily['close'].iloc[-1]
-    latest_time = df_daily.index[-1]
+    if df_daily is None: return latest_price, latest_time, "日線資料獲取或清理失敗"
+
+    # 如果沒有抓到即時價格，就用最新的日線收盤價作為備案
+    if latest_price is None:
+        latest_price = df_daily['close'].iloc[-1]
+        latest_time = df_daily.index[-1].tz_localize('Asia/Taipei')
+    
     df_daily['sma_5'] = df_daily.ta.sma(length=5, close='close')
     df_daily['sma_20'] = df_daily.ta.sma(length=20, close='close')
     if df_daily['sma_20'].isnull().all(): return latest_price, latest_time, "指標計算失敗"
+    
     signal = calculate_latest_signal(df_daily)
     return latest_price, latest_time, signal
+# --- ▲▲▲ 關鍵修改 ▲▲▲ ---
 
 def run_trading_job():
-    # --- ▼▼▼ 關鍵修改：獲取當前台北時間作為檢查時間戳 ▼▼▼ ---
-    check_timestamp = pd.Timestamp.now(tz='Asia/Taipei')
-    # --- ▲▲▲ 關鍵修改 ▲▲▲ ---
-    
     stock_id = get_setting('live_stock_id') or "2308.TW"
     try:
+        # --- ▼▼▼ 關鍵修改：使用 check_timestamp 確保時間一致性 ▼▼▼ ---
+        check_timestamp = pd.Timestamp.now(tz='Asia/Taipei')
         logging.info(f"🤖 API被觸發，開始檢查 {stock_id} at {check_timestamp.strftime('%Y-%m-%d %H:%M:%S')}...")
         
-        # 我們只用 data_timestamp 來代表數據本身的日期，用於計算
         latest_price, data_timestamp, signal = get_latest_price_and_signal(stock_id)
 
         if latest_price is None: return {"status": "error", "message": "無法獲取最新價格資料"}
         if "失敗" in signal or "異常" in signal: return {"status": "error", "message": signal}
         
-        logging.info(f"   - 最新價格 ({data_timestamp.date()}): {latest_price:.2f}, 日線訊號: {signal}")
+        logging.info(f"   - 資料時間: {data_timestamp.strftime('%Y-%m-%d %H:%M')}, 最新價格: {latest_price:.2f}, 日線訊號: {signal}")
         
         portfolio = get_current_portfolio(stock_id)
         
-        # --- ▼▼▼ 關鍵修改：使用 check_timestamp 進行日誌記錄 ▼▼▼ ---
         stop_loss_triggered = check_stop_loss(check_timestamp, latest_price, portfolio, stock_id)
         if not stop_loss_triggered:
             execute_trade(check_timestamp, signal, latest_price, portfolio, stock_id)
@@ -242,14 +261,12 @@ def run_trading_job():
         final_portfolio = get_current_portfolio(stock_id)
         total_asset = final_portfolio['cash'] + (final_portfolio['position'] * float(latest_price))
         log_performance(check_timestamp.date(), stock_id, total_asset)
-        # --- ▲▲▲ 關鍵修改 ▲▲▲ ---
-
+        
         message = f"檢查完成。總資產: {total_asset:,.2f}"
-        logging.info(f"   {message}")
         return {"status": "success", "message": message}
+        # --- ▲▲▲ 關鍵修改 ▲▲▲ ---
     except Exception as e:
-        logging.error(f"❌ 執行交易任務時發生未預期錯誤: {e}")
-        logging.error(traceback.format_exc())
+        traceback.print_exc()
         return {"status": "error", "message": str(e)}
 
 # --- 4. Flask Web 應用 ---
@@ -427,43 +444,26 @@ def get_live_dashboard_data():
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT value FROM settings WHERE key = %s", ('live_stock_id',))
-            stock_id_result = cur.fetchone()
-            stock_id = stock_id_result['value'] if stock_id_result else '2308.TW'
-
+            stock_id = get_setting('live_stock_id')
             stock_specific_cash_key = f"initial_cash_{stock_id}"
-            cur.execute("SELECT value FROM settings WHERE key = %s", (stock_specific_cash_key,))
-            initial_cash_result = cur.fetchone()
-            initial_cash = initial_cash_result['value'] if initial_cash_result else CASH
-
+            initial_cash = get_setting(stock_specific_cash_key) or CASH
             cur.execute("SELECT * FROM trades WHERE stock_id = %s ORDER BY timestamp DESC", (stock_id,))
             trades = cur.fetchall()
             cur.execute("SELECT * FROM daily_performance WHERE stock_id = %s ORDER BY date ASC", (stock_id,))
             performance = cur.fetchall()
-
             latest_price, latest_signal = "N/A", "N/A"
             try:
                 latest_price, _, latest_signal = get_latest_price_and_signal(stock_id)
                 if latest_price is None: latest_price = "N/A"
                 if latest_signal is None: latest_signal = "N/A"
             except Exception as e:
-                print(f"❌ 獲取儀表板即時數據時發生錯誤: {e}")
-
+                logging.error(f"❌ 獲取儀表板即時數據時發生錯誤: {e}")
             if performance:
                 total_asset = performance[-1]['asset_value']
             else:
                 current_portfolio = get_current_portfolio(stock_id)
                 total_asset = current_portfolio['cash']
-            
-            return {
-                "chart_data": {'dates': [p['date'] for p in performance], 'values': [p['asset_value'] for p in performance]},
-                "trades": [dict(row) for row in trades],
-                "latest_price": latest_price,
-                "latest_signal": latest_signal,
-                "total_asset": total_asset,
-                "stock_id": stock_id, 
-                "initial_cash": initial_cash
-            }
+            return {"chart_data": {'dates': [p['date'] for p in performance], 'values': [p['asset_value'] for p in performance]},"trades": [dict(row) for row in trades],"latest_price": latest_price,"latest_signal": latest_signal,"total_asset": total_asset,"stock_id": stock_id, "initial_cash": initial_cash}
     finally:
         conn.close()
 
@@ -475,9 +475,7 @@ def dashboard():
 @app.route('/api/trigger-trade-check', methods=['POST'])
 def trigger_trade_check():
     auth_header = request.headers.get('Authorization')
-    if auth_header != f"Bearer {API_SECRET_KEY}":
-        logging.warning("收到未經授權的 API 請求")
-        return jsonify({"status": "error", "message": "未經授權"}), 401
+    if auth_header != f"Bearer {API_SECRET_KEY}": return jsonify({"status": "error", "message": "未經授權"}), 401
     result = run_trading_job()
     if result.get('status') == 'success': return jsonify(result), 200
     else: return jsonify(result), 500
@@ -530,7 +528,7 @@ def handle_backtest():
                         trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '執行買入', 'shares': ADD_ON_SHARES, 'price': price, 'total_value': price * ADD_ON_SHARES, 'profit': None})
             elif signal == "賣出" and backtest_portfolio['position'] > 0:
                 profit = (price - backtest_portfolio['avg_cost']) * backtest_portfolio['position']
-                trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '執行賣出', 'shares': backtest_portfolio['position'], 'price': price, 'total_value': price * backtest_portfolio['position'], 'profit': profit})
+                trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '訊號賣出', 'shares': backtest_portfolio['position'], 'price': price, 'total_value': price * backtest_portfolio['position'], 'profit': profit})
                 backtest_portfolio['cash'] += price * backtest_portfolio['position']
                 backtest_portfolio['position'], backtest_portfolio['avg_cost'] = 0, 0
             daily_assets.append(backtest_portfolio['cash'] + (backtest_portfolio['position'] * price))
@@ -548,7 +546,8 @@ def update_settings_api():
     if not key or not value: return jsonify({"status": "error", "message": "缺少 key 或 value"}), 400
     if key == 'initial_cash':
         stock_id = data.get('stock_id')
-        if not stock_id: return jsonify({"status": "error", "message": "更新初始資金時必須提供 stock_id"}), 400
+        if not stock_id:
+            return jsonify({"status": "error", "message": "更新初始資金時必須提供 stock_id"}), 400
         db_key = f"initial_cash_{stock_id}"
     else:
         db_key = key
