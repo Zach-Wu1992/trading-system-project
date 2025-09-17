@@ -4,7 +4,7 @@
 
 ## **專案預覽**
 
-*(請將此處的連結替換為您自己上傳到 GitHub 的最新儀表板截圖，記得要展示出新的設定區塊！)*
+<img width="1760" height="3090" alt="screen" src="https://github.com/user-attachments/assets/acd3d29f-4158-4e2f-a01f-787fdd0f1ea5" />
 
 ## **系統架構**
 
