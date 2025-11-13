@@ -209,15 +209,15 @@ def get_latest_price_and_signal(stock_id):
     # 步驟 1: 獲取最新即時價格
     latest_price = None
     latest_time = pd.Timestamp.now(tz='Asia/Taipei') # 預設為當前時間
-    try:
-        df_tick_raw = fm.get_data(dataset="TaiwanStockPriceTick", data_id=stock_id_clean, start_date=today_str)
-        if not df_tick_raw.empty:
-            latest_price = df_tick_raw['deal_price'].iloc[-1]
-            # 將時間字串轉換為 pandas 的 Timestamp 物件
-            latest_time_str = f"{df_tick_raw['date'].iloc[-1]} {df_tick_raw['time'].iloc[-1]}"
-            latest_time = pd.to_datetime(latest_time_str).tz_localize('Asia/Taipei')
-    except Exception as e:
-        logging.warning(f"⚠️ 獲取即時 Tick 資料失敗: {e}")
+    # try:
+    #     df_tick_raw = fm.get_data(dataset="TaiwanStockPriceTick", data_id=stock_id_clean, start_date=today_str)
+    #     if not df_tick_raw.empty:
+    #         latest_price = df_tick_raw['deal_price'].iloc[-1]
+    #         # 將時間字串轉換為 pandas 的 Timestamp 物件
+    #         latest_time_str = f"{df_tick_raw['date'].iloc[-1]} {df_tick_raw['time'].iloc[-1]}"
+    #         latest_time = pd.to_datetime(latest_time_str).tz_localize('Asia/Taipei')
+    # except Exception as e:
+    #     logging.warning(f"⚠️ 獲取即時 Tick 資料失敗: {e}")
 
     # 步驟 2: 獲取日線資料來計算訊號
     start_date_daily = (pd.Timestamp.now() - pd.DateOffset(days=60)).strftime('%Y-%m-%d')
