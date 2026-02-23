@@ -22,8 +22,6 @@ FINMIND_API_TOKEN = os.environ.get('FINMIND_API_TOKEN')
 
 pd.set_option('display.max_columns', None)
 CASH = 1000000
-ADD_ON_SHARES = 1000
-MAX_POSITION_SHARES = 3000
 STOP_LOSS_PCT = 0.15 # 15% 停損
 TAKE_PROFIT_PCT = 0.30 # 30% 基本停利滿足點
 
@@ -143,9 +141,11 @@ def get_current_portfolio(stock_id):
 def execute_trade(timestamp, signal, price, portfolio, stock_id):
     if signal == "買入":
         log_trade(timestamp, stock_id, "買入訊號", 0, price)
-        if portfolio['position'] < MAX_POSITION_SHARES and (portfolio['position'] == 0 or price > portfolio['avg_cost']) and portfolio['cash'] >= price * ADD_ON_SHARES:
-            log_trade(timestamp, stock_id, "執行買入", ADD_ON_SHARES, price)
-            logging.info(f"📈【執行買入】時間 {timestamp.strftime('%Y-%m-%d %H:%M')}，價格 {price:.2f}")
+        # 只要還有資金夠買最少一股，就把資金打滿
+        shares_to_buy = int(portfolio['cash'] // price)
+        if shares_to_buy > 0 and (portfolio['position'] == 0 or price > portfolio['avg_cost']):
+            log_trade(timestamp, stock_id, "執行買入", shares_to_buy, price)
+            logging.info(f"📈【執行買入(資金打滿)】時間 {timestamp.strftime('%Y-%m-%d %H:%M')}，股數 {shares_to_buy}，價格 {price:.2f}")
     elif signal == "賣出":
         log_trade(timestamp, stock_id, "賣出訊號", 0, price)
         if portfolio['position'] > 0:
@@ -607,24 +607,26 @@ def handle_backtest():
                     backtest_portfolio['position'], backtest_portfolio['avg_cost'] = 0, 0
                     action_taken = True
                     
-            # 處理買進 (如果今天沒有停利/停損賣出才能買進，避免同一天買又賣)
-            if not action_taken and signal == "買入" and backtest_portfolio['position'] < MAX_POSITION_SHARES:
+            # 處理買進 (資金打滿無限制)
+            if not action_taken and signal == "買入":
+                # 如果是空手，或者是加碼（但目前全倉策略下，加碼情況可能較少出現，除非之前沒買滿或有額外注資）
                 if backtest_portfolio['position'] == 0 or price > backtest_portfolio['avg_cost']:
-                    if backtest_portfolio['cash'] >= price * ADD_ON_SHARES:
+                    shares_to_buy = int(backtest_portfolio['cash'] // price)
+                    if shares_to_buy > 0:
                         old_total = backtest_portfolio['avg_cost'] * backtest_portfolio['position']
-                        new_total = old_total + (price * ADD_ON_SHARES)
-                        backtest_portfolio['position'] += ADD_ON_SHARES
-                        backtest_portfolio['cash'] -= price * ADD_ON_SHARES
+                        new_total = old_total + (price * shares_to_buy)
+                        backtest_portfolio['position'] += shares_to_buy
+                        backtest_portfolio['cash'] -= price * shares_to_buy
                         backtest_portfolio['avg_cost'] = new_total / backtest_portfolio['position']
-                        trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '執行買入', 'shares': ADD_ON_SHARES, 'price': price, 'total_value': price * ADD_ON_SHARES, 'profit': None})
-                    else:
+                        trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '執行買入', 'shares': shares_to_buy, 'price': price, 'total_value': price * shares_to_buy, 'profit': None})
+                    elif backtest_portfolio['position'] == 0:
                         insufficient_funds = True
                         last_insufficient_price = price
             
             daily_assets.append(backtest_portfolio['cash'] + (backtest_portfolio['position'] * price))
 
         if len(trade_log) == 0 and insufficient_funds:
-            return jsonify({"error": f"回測期間出現買入訊號，但初始資金 ({initial_cash:,.0f}) 不足買進基本單位 (需約 {last_insufficient_price*ADD_ON_SHARES:,.0f} 元)。請手動調高初始資金！"}), 400
+            return jsonify({"error": f"回測期間出現買入訊號，但初始資金 ({initial_cash:,.0f}) 不足買進基本單位 (至少需約 {last_insufficient_price:,.0f} 元買進1股)。請手動調高初始資金！"}), 400
 
         results = {"chart_data": {"dates": [d.strftime('%Y-%m-%d') for d in df.index],"values": daily_assets},"trades": trade_log}
         return jsonify(results)
