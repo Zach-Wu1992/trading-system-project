@@ -462,7 +462,12 @@ HTML_TEMPLATE = """
                 renderTablePage('backtest');
                 document.getElementById('backtest-results').classList.remove('hidden');
             } else {
-                alert('回測執行失敗，請檢查終端機日誌。');
+                try {
+                    const errResult = await response.json();
+                    alert('注意: ' + (errResult.error || errResult.message || '執行失敗'));
+                } catch(err) {
+                    alert('回測執行失敗，請檢查終端機日誌。');
+                }
             }
         });
     </script>
@@ -571,6 +576,9 @@ def handle_backtest():
         
         backtest_portfolio = {'cash': initial_cash, 'position': 0, 'avg_cost': 0}
         daily_assets, trade_log = [], []
+        insufficient_funds = False
+        last_insufficient_price = 0
+        
         for index, row in df.iterrows():
             price, signal, ma50 = row['close'], row['signal'], row['sma_50']
             action_taken = False
@@ -609,8 +617,14 @@ def handle_backtest():
                         backtest_portfolio['cash'] -= price * ADD_ON_SHARES
                         backtest_portfolio['avg_cost'] = new_total / backtest_portfolio['position']
                         trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '執行買入', 'shares': ADD_ON_SHARES, 'price': price, 'total_value': price * ADD_ON_SHARES, 'profit': None})
+                    else:
+                        insufficient_funds = True
+                        last_insufficient_price = price
             
             daily_assets.append(backtest_portfolio['cash'] + (backtest_portfolio['position'] * price))
+
+        if len(trade_log) == 0 and insufficient_funds:
+            return jsonify({"error": f"回測期間出現買入訊號，但初始資金 ({initial_cash:,.0f}) 不足買進基本單位 (需約 {last_insufficient_price*ADD_ON_SHARES:,.0f} 元)。請手動調高初始資金！"}), 400
 
         results = {"chart_data": {"dates": [d.strftime('%Y-%m-%d') for d in df.index],"values": daily_assets},"trades": trade_log}
         return jsonify(results)
