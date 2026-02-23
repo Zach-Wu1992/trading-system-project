@@ -25,6 +25,7 @@ CASH = 1000000
 ADD_ON_SHARES = 1000
 MAX_POSITION_SHARES = 3000
 STOP_LOSS_PCT = 0.15 # 15% 停損
+TAKE_PROFIT_PCT = 0.30 # 30% 基本停利滿足點
 
 # --- 2. 核心資料庫函式 (PostgreSQL 版) ---
 def get_db_connection():
@@ -166,6 +167,27 @@ def check_stop_loss(timestamp, price, portfolio, stock_id):
             return True
     return False
 
+def check_take_profit(timestamp, price, ma50, portfolio, stock_id):
+    if portfolio['position'] > 0:
+        # 條件 1: 到達固定風險報酬比的停利點 (30%)
+        take_profit_price = portfolio['avg_cost'] * (1 + TAKE_PROFIT_PCT)
+        if price > take_profit_price:
+            shares_to_sell = portfolio['position']
+            profit = (price - portfolio['avg_cost']) * shares_to_sell
+            log_trade(timestamp, stock_id, "獲利了結(滿足30%)", shares_to_sell, price, profit)
+            logging.info(f"🎉【達成停利】時間 {timestamp.strftime('%Y-%m-%d %H:%M')}! 滿足 30% 獲利目標。")
+            return True
+            
+        # 條件 2: 波段跌破 MA50 且目前為帳面獲利狀態 (動態停利保本)
+        if ma50 is not None and price < ma50 and price > portfolio['avg_cost']:
+            shares_to_sell = portfolio['position']
+            profit = (price - portfolio['avg_cost']) * shares_to_sell
+            log_trade(timestamp, stock_id, "動態停利(跌破MA50)", shares_to_sell, price, profit)
+            logging.info(f"🛡️【動態保本】時間 {timestamp.strftime('%Y-%m-%d %H:%M')}! 價格跌破季線(MA50)提前獲利了結。")
+            return True
+            
+    return False
+
 # --- ▼▼▼ 關鍵修改：獲取資料的邏輯升級與交易邏輯修改 ▼▼▼ ---
 def get_historical_data(stock_id):
     # 下載近兩年(約 500 天)的資料以確保 MA200(20天前) 與 52-Week 高低點計算無誤
@@ -232,13 +254,14 @@ def get_latest_price_and_signal(stock_id):
 
     df = get_historical_data(stock_id)
     if df is None or df.empty:
-        return None, None, "無法從 yfinance 獲取資料"
+        return None, None, "無法從 yfinance 獲取資料", None
 
     latest_price = df['close'].iloc[-1]
     latest_time = df.index[-1]
+    latest_ma50 = df['sma_50'].iloc[-1]
     
     signal = calculate_latest_signal(df)
-    return latest_price, latest_time, signal
+    return latest_price, latest_time, signal, latest_ma50
 # --- ▲▲▲ 關鍵修改 ▲▲▲ ---
 
 def run_trading_job():
@@ -248,18 +271,23 @@ def run_trading_job():
         check_timestamp = pd.Timestamp.now(tz='Asia/Taipei')
         logging.info(f"🤖 API被觸發，開始檢查 {stock_id} at {check_timestamp.strftime('%Y-%m-%d %H:%M:%S')}...")
         
-        latest_price, data_timestamp, signal = get_latest_price_and_signal(stock_id)
+        latest_price, data_timestamp, signal, ma50 = get_latest_price_and_signal(stock_id)
 
         if latest_price is None: return {"status": "error", "message": "無法獲取最新價格資料"}
         if "失敗" in signal or "異常" in signal: return {"status": "error", "message": signal}
         
-        logging.info(f"   - 資料時間: {data_timestamp.strftime('%Y-%m-%d %H:%M')}, 最新價格: {latest_price:.2f}, 日線訊號: {signal}")
+        logging.info(f"   - 資料時間: {data_timestamp.strftime('%Y-%m-%d %H:%M')}, 最新價格: {latest_price:.2f}, MA50: {ma50:.2f}, 日線訊號: {signal}")
         
         portfolio = get_current_portfolio(stock_id)
         
+        # 1. 優先檢查停損
         stop_loss_triggered = check_stop_loss(check_timestamp, latest_price, portfolio, stock_id)
         if not stop_loss_triggered:
-            execute_trade(check_timestamp, signal, latest_price, portfolio, stock_id)
+            # 2. 如果沒有停損，則檢查是否達到獲利了結點
+            take_profit_triggered = check_take_profit(check_timestamp, latest_price, ma50, portfolio, stock_id)
+            if not take_profit_triggered:
+                # 3. 既沒停損也沒停利，才執行普通的進出場交易訊號
+                execute_trade(check_timestamp, signal, latest_price, portfolio, stock_id)
         
         final_portfolio = get_current_portfolio(stock_id)
         total_asset = final_portfolio['cash'] + (final_portfolio['position'] * float(latest_price))
@@ -454,13 +482,13 @@ def get_live_dashboard_data():
             trades = cur.fetchall()
             cur.execute("SELECT * FROM daily_performance WHERE stock_id = %s ORDER BY date ASC", (stock_id,))
             performance = cur.fetchall()
-        latest_price, latest_signal = "N/A", "N/A"
-        try:
-            latest_price, _, latest_signal = get_latest_price_and_signal(stock_id)
-            if latest_price is None: latest_price = "N/A"
-            if latest_signal is None: latest_signal = "N/A"
-        except Exception as e:
-            logging.error(f"❌ 獲取儀表板即時數據時發生錯誤: {e}")
+            latest_price, latest_signal = "N/A", "N/A"
+            try:
+                result = get_latest_price_and_signal(stock_id)
+                if result[0] is not None: latest_price = result[0]
+                if result[2] is not None: latest_signal = result[2]
+            except Exception as e:
+                logging.error(f"❌ 獲取儀表板即時數據時發生錯誤: {e}")
         if performance:
             total_asset = performance[-1]['asset_value']
         else:
@@ -544,18 +572,35 @@ def handle_backtest():
         backtest_portfolio = {'cash': initial_cash, 'position': 0, 'avg_cost': 0}
         daily_assets, trade_log = [], []
         for index, row in df.iterrows():
-            price, signal = row['close'], row['signal']
+            price, signal, ma50 = row['close'], row['signal'], row['sma_50']
+            action_taken = False
+            
             # 優先檢查停損
             if backtest_portfolio['position'] > 0:
                 stop_loss_price = backtest_portfolio['avg_cost'] * (1 - STOP_LOSS_PCT)
+                take_profit_price = backtest_portfolio['avg_cost'] * (1 + TAKE_PROFIT_PCT)
+                
                 if price < stop_loss_price:
                     profit = (price - backtest_portfolio['avg_cost']) * backtest_portfolio['position']
                     trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '停損賣出', 'shares': backtest_portfolio['position'], 'price': price, 'total_value': price * backtest_portfolio['position'], 'profit': profit})
                     backtest_portfolio['cash'] += price * backtest_portfolio['position']
                     backtest_portfolio['position'], backtest_portfolio['avg_cost'] = 0, 0
+                    action_taken = True
+                elif price > take_profit_price:
+                    profit = (price - backtest_portfolio['avg_cost']) * backtest_portfolio['position']
+                    trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '獲利了結(滿足30%)', 'shares': backtest_portfolio['position'], 'price': price, 'total_value': price * backtest_portfolio['position'], 'profit': profit})
+                    backtest_portfolio['cash'] += price * backtest_portfolio['position']
+                    backtest_portfolio['position'], backtest_portfolio['avg_cost'] = 0, 0
+                    action_taken = True
+                elif price < ma50 and price > backtest_portfolio['avg_cost']:
+                    profit = (price - backtest_portfolio['avg_cost']) * backtest_portfolio['position']
+                    trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '動態停利(跌破MA50)', 'shares': backtest_portfolio['position'], 'price': price, 'total_value': price * backtest_portfolio['position'], 'profit': profit})
+                    backtest_portfolio['cash'] += price * backtest_portfolio['position']
+                    backtest_portfolio['position'], backtest_portfolio['avg_cost'] = 0, 0
+                    action_taken = True
                     
-            # 處理買進 (注意如果剛停損賣出，不應該馬上又買進，此處因訊號通常不會同時發生尚可接受)
-            if signal == "買入" and backtest_portfolio['position'] < MAX_POSITION_SHARES:
+            # 處理買進 (如果今天沒有停利/停損賣出才能買進，避免同一天買又賣)
+            if not action_taken and signal == "買入" and backtest_portfolio['position'] < MAX_POSITION_SHARES:
                 if backtest_portfolio['position'] == 0 or price > backtest_portfolio['avg_cost']:
                     if backtest_portfolio['cash'] >= price * ADD_ON_SHARES:
                         old_total = backtest_portfolio['avg_cost'] * backtest_portfolio['position']
