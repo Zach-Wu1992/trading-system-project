@@ -57,7 +57,7 @@ def setup_database():
                     key TEXT PRIMARY KEY, value TEXT NOT NULL
                 )
             ''')
-            cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING", ('live_stock_id', '2308.TW'))
+            cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING", ('live_stock_id', '2330.TW'))
         conn.commit()
         logging.info("✅ 資料庫設定完成。")
     except Exception as e:
@@ -242,7 +242,7 @@ def get_latest_price_and_signal(stock_id):
 # --- ▲▲▲ 關鍵修改 ▲▲▲ ---
 
 def run_trading_job():
-    stock_id = get_setting('live_stock_id') or "2308.TW"
+    stock_id = get_setting('live_stock_id') or "2330.TW"
     try:
         # --- ▼▼▼ 關鍵修改：使用 check_timestamp 確保時間一致性 ▼▼▼ ---
         check_timestamp = pd.Timestamp.now(tz='Asia/Taipei')
