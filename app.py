@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 # --- 匯入函式庫 ---
 import pandas as pd
-import pandas_ta as ta
 import os
 import json
 import traceback
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template_string, request, jsonify
-from FinMind.data import FinMindApi
 import logging
 from datetime import datetime
+import yfinance as yf
+from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
 
 # --- 1. 全域設定與參數 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,19 +24,7 @@ pd.set_option('display.max_columns', None)
 CASH = 1000000
 ADD_ON_SHARES = 1000
 MAX_POSITION_SHARES = 3000
-STOP_LOSS_PCT = 0.02
-
-# --- 初始化 FinMind API 客戶端 ---
-fm = None
-if FINMIND_API_TOKEN:
-    try:
-        fm = FinMindApi()
-        fm.login_by_token(FINMIND_API_TOKEN)
-        print("✅ FinMind API 客戶端初始化成功")
-    except Exception as e:
-        print(f"❌ FinMind 登入失敗: {e}")
-else:
-    logging.warning("⚠️ 警告：未設定 FINMIND_API_TOKEN 環境變數。")
+STOP_LOSS_PCT = 0.15 # 15% 停損
 
 # --- 2. 核心資料庫函式 (PostgreSQL 版) ---
 def get_db_connection():
@@ -177,64 +166,78 @@ def check_stop_loss(timestamp, price, portfolio, stock_id):
             return True
     return False
 
-def clean_df_finmind(df_raw):
-    if df_raw is None or df_raw.empty: return None
-    df = df_raw.copy()
-    df.rename(columns={'max': 'high', 'min': 'low', 'Trading_Volume': 'volume'}, inplace=True)
-    df['date'] = pd.to_datetime(df['date'])
-    df.set_index('date', inplace=True)
-    required_cols = ['open', 'high', 'low', 'close', 'volume']
-    if not all(col in df.columns for col in required_cols):
-        logging.error(f"❌ FinMind 資料清理失敗：缺少必要欄位. 現有: {df.columns.tolist()}")
+# --- ▼▼▼ 關鍵修改：獲取資料的邏輯升級與交易邏輯修改 ▼▼▼ ---
+def get_historical_data(stock_id):
+    # 下載近兩年(約 500 天)的資料以確保 MA200(20天前) 與 52-Week 高低點計算無誤
+    ticker = yf.Ticker(stock_id)
+    df = ticker.history(period="2y")
+    if df.empty:
         return None
+    
+    # 統一小寫並整理欄位
+    df.index = df.index.tz_convert('Asia/Taipei')
+    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].rename(columns={
+        'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'
+    })
+    
+    # 計算指標
+    df['sma_50'] = df['close'].rolling(window=50).mean()
+    df['sma_150'] = df['close'].rolling(window=150).mean()
+    df['sma_200'] = df['close'].rolling(window=200).mean()
+    
+    # 計算 52-week(252交易日)高點與低點
+    df['52w_high'] = df['high'].rolling(window=252).max()
+    df['52w_low'] = df['low'].rolling(window=252).min()
+    
+    # 為了比較 MA200 是否斜率向上，取 20 天前的 MA200
+    df['sma_200_20d_ago'] = df['sma_200'].shift(20)
+    
     return df
 
 def calculate_latest_signal(df):
-    latest_data = df.iloc[-2:]
-    if len(latest_data) < 2: return "資料不足"
-    yesterday_sma5, yesterday_sma20 = latest_data[['sma_5', 'sma_20']].iloc[0]
-    today_sma5, today_sma20 = latest_data[['sma_5', 'sma_20']].iloc[1]
-    signal = "持有"
-    if yesterday_sma5 < yesterday_sma20 and today_sma5 > today_sma20: signal = "買入"
-    elif yesterday_sma5 > yesterday_sma20 and today_sma5 < today_sma20: signal = "賣出"
-    return signal
+    if df is None or len(df) < 5: 
+        return "資料不足"
+    
+    # 取得最新與昨日資料
+    today = df.iloc[-1]
+    yesterday_signal = "持有"
+    
+    # 定義買入條件的函式，方便應用於整個 df 或單筆資料
+    def is_buy_condition_met(row):
+        try:
+            cond1 = row['close'] > row['sma_150'] and row['close'] > row['sma_200']
+            cond2 = row['sma_150'] > row['sma_200']
+            cond3 = row['sma_200'] > row['sma_200_20d_ago']
+            cond4 = row['sma_50'] > row['sma_150']
+            cond5 = row['close'] > 1.25 * row['52w_low']
+            cond6 = row['close'] > 0.75 * row['52w_high']
+            return all([cond1, cond2, cond3, cond4, cond5, cond6])
+        except Exception:
+            return False
 
-# --- ▼▼▼ 關鍵修改：獲取資料的邏輯升級 ▼▼▼ ---
+    # 必須是 "新突破" (昨日未滿足，今日滿足)
+    yesterday_met = is_buy_condition_met(df.iloc[-2]) if len(df) >= 2 else False
+    today_met = is_buy_condition_met(today)
+    
+    if today_met and not yesterday_met:
+        return "買入"
+    
+    # 賣出邏輯已由 check_stop_loss (15%) 統一處理，不再這裡產生賣出訊號
+    return "持有"
+
 def get_latest_price_and_signal(stock_id):
-    if not fm: return None, None, "FinMind 未初始化"
-    
-    today_str = pd.Timestamp.now(tz='Asia/Taipei').strftime('%Y-%m-%d')
-    stock_id_clean = stock_id.replace('.TW', '')
+    # 如果代號沒有後綴，預設加上 .TW 以符合台股 yfinance 格式
+    if not stock_id.endswith('.TW') and not stock_id.endswith('.TWO'):
+        stock_id = f"{stock_id}.TW"
 
-    # 步驟 1: 獲取最新即時價格
-    latest_price = None
-    latest_time = pd.Timestamp.now(tz='Asia/Taipei') # 預設為當前時間
-    try:
-        df_tick_raw = fm.get_data(dataset="TaiwanStockPriceTick", data_id=stock_id_clean, start_date=today_str)
-        if not df_tick_raw.empty:
-            latest_price = df_tick_raw['deal_price'].iloc[-1]
-            # 將時間字串轉換為 pandas 的 Timestamp 物件
-            latest_time_str = f"{df_tick_raw['date'].iloc[-1]} {df_tick_raw['time'].iloc[-1]}"
-            latest_time = pd.to_datetime(latest_time_str).tz_localize('Asia/Taipei')
-    except Exception as e:
-        logging.warning(f"⚠️ 獲取即時 Tick 資料失敗: {e}")
+    df = get_historical_data(stock_id)
+    if df is None or df.empty:
+        return None, None, "無法從 yfinance 獲取資料"
 
-    # 步驟 2: 獲取日線資料來計算訊號
-    start_date_daily = (pd.Timestamp.now() - pd.DateOffset(days=60)).strftime('%Y-%m-%d')
-    df_daily_raw = fm.get_data(dataset="TaiwanStockPrice", data_id=stock_id_clean, start_date=start_date_daily, end_date=today_str)
-    df_daily = clean_df_finmind(df_daily_raw)
-    if df_daily is None: return latest_price, latest_time, "日線資料獲取或清理失敗"
-
-    # 如果沒有抓到即時價格，就用最新的日線收盤價作為備案
-    if latest_price is None:
-        latest_price = df_daily['close'].iloc[-1]
-        latest_time = df_daily.index[-1].tz_localize('Asia/Taipei')
+    latest_price = df['close'].iloc[-1]
+    latest_time = df.index[-1]
     
-    df_daily['sma_5'] = df_daily.ta.sma(length=5, close='close')
-    df_daily['sma_20'] = df_daily.ta.sma(length=20, close='close')
-    if df_daily['sma_20'].isnull().all(): return latest_price, latest_time, "指標計算失敗"
-    
-    signal = calculate_latest_signal(df_daily)
+    signal = calculate_latest_signal(df)
     return latest_price, latest_time, signal
 # --- ▲▲▲ 關鍵修改 ▲▲▲ ---
 
@@ -316,7 +319,7 @@ HTML_TEMPLATE = """
                         <div class="flex-grow"><label for="live_initial_cash" class="block text-sm font-medium text-gray-300">初始資金 (針對 {{ live_data.stock_id }})</label><input type="number" id="live_initial_cash" value="{{ live_data.initial_cash }}" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white"></div>
                         <button type="button" id="update-cash-btn" class="bg-yellow-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-yellow-700 h-10">修改資金</button>
                     </div>
-                    <div><label for="cron_time" class="block text-sm font-medium text-gray-300">自動執行時間</label><input type="text" id="cron_time" value="交易日 09-13點，每小時一次" readonly class="mt-1 block w-full bg-gray-900 border-gray-600 rounded-md text-gray-400"></div>
+                    <div><label for="cron_time" class="block text-sm font-medium text-gray-300">自動執行時間</label><input type="text" id="cron_time" value="交易日 13:30 收盤後每天一次 (背景排程)" readonly class="mt-1 block w-full bg-gray-900 border-gray-600 rounded-md text-gray-400"></div>
                 </div>
                 <div id="settings-status" class="mt-2 text-sm h-5"></div></div><div><h3 class="text-xl font-semibold mb-4 text-white">手動操作</h3><button type="button" id="manual-trigger-btn" class="w-full bg-indigo-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-indigo-700 h-10">手動觸發檢查</button></div></div></section>
                 <section class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"><div class="bg-gray-800 p-6 rounded-lg"><h3 class="text-gray-400 text-sm font-medium">最新股價</h3><p id="live-latest-price" class="text-white text-3xl font-semibold">{{ "%.2f"|format(live_data.latest_price) if live_data.latest_price != "N/A" else "N/A" }}</p></div><div class="bg-gray-800 p-6 rounded-lg"><h3 class="text-gray-400 text-sm font-medium">當前訊號</h3><p id="live-latest-signal" class="text-3xl font-semibold {{ 'buy-action' if live_data.latest_signal == '買入' else 'sell-action' if live_data.latest_signal == '賣出' else 'hold-action' }}">{{ live_data.latest_signal }}</p></div><div class="bg-gray-800 p-6 rounded-lg"><h3 class="text-gray-400 text-sm font-medium">總資產</h3><p id="live-total-asset" class="text-white text-3xl font-semibold">{{ "%.2f"|format(live_data.total_asset) if live_data.total_asset != "N/A" else "N/A" }}</p></div></section>
@@ -451,19 +454,19 @@ def get_live_dashboard_data():
             trades = cur.fetchall()
             cur.execute("SELECT * FROM daily_performance WHERE stock_id = %s ORDER BY date ASC", (stock_id,))
             performance = cur.fetchall()
-            latest_price, latest_signal = "N/A", "N/A"
-            try:
-                latest_price, _, latest_signal = get_latest_price_and_signal(stock_id)
-                if latest_price is None: latest_price = "N/A"
-                if latest_signal is None: latest_signal = "N/A"
-            except Exception as e:
-                logging.error(f"❌ 獲取儀表板即時數據時發生錯誤: {e}")
-            if performance:
-                total_asset = performance[-1]['asset_value']
-            else:
-                current_portfolio = get_current_portfolio(stock_id)
-                total_asset = current_portfolio['cash']
-            return {"chart_data": {'dates': [p['date'] for p in performance], 'values': [p['asset_value'] for p in performance]},"trades": [dict(row) for row in trades],"latest_price": latest_price,"latest_signal": latest_signal,"total_asset": total_asset,"stock_id": stock_id, "initial_cash": initial_cash}
+        latest_price, latest_signal = "N/A", "N/A"
+        try:
+            latest_price, _, latest_signal = get_latest_price_and_signal(stock_id)
+            if latest_price is None: latest_price = "N/A"
+            if latest_signal is None: latest_signal = "N/A"
+        except Exception as e:
+            logging.error(f"❌ 獲取儀表板即時數據時發生錯誤: {e}")
+        if performance:
+            total_asset = performance[-1]['asset_value']
+        else:
+            current_portfolio = get_current_portfolio(stock_id)
+            total_asset = current_portfolio['cash']
+        return {"chart_data": {'dates': [p['date'] for p in performance], 'values': [p['asset_value'] for p in performance]},"trades": [dict(row) for row in trades],"latest_price": latest_price,"latest_signal": latest_signal,"total_asset": total_asset,"stock_id": stock_id, "initial_cash": initial_cash}
     finally:
         conn.close()
 
@@ -487,29 +490,62 @@ def handle_backtest():
         stock_id, start_date = params.get('stock_id', '2330.TW'), params.get('start_date', '2024-01-01')
         end_date = params.get('end_date') or pd.Timestamp.now().strftime('%Y-%m-%d')
         initial_cash = int(params.get('initial_cash', CASH))
-        if not end_date: end_date = pd.Timestamp.now().strftime('%Y-%m-%d')
+        if not stock_id.endswith('.TW') and not stock_id.endswith('.TWO'):
+            stock_id_query = f"{stock_id}.TW"
+        else:
+            stock_id_query = stock_id
+            
+        ticker = yf.Ticker(stock_id_query)
+        # 多抓兩年的資料來計算指標，之後再過濾出 start_date 與 end_date
+        extended_start = (pd.to_datetime(start_date) - pd.DateOffset(years=2)).strftime('%Y-%m-%d')
+        df_raw = ticker.history(start=extended_start, end=end_date)
         
-        if not fm: return jsonify({"error": "FinMind 未初始化，請檢查 API Token"}), 500
+        if df_raw.empty: return jsonify({"error": "無法從 yfinance 下載資料"}), 400
         
-        df_raw = fm.get_data(dataset="TaiwanStockPrice", data_id=stock_id.replace('.TW', ''), start_date=start_date, end_date=end_date)
-        df = clean_df_finmind(df_raw)
-        if df is None: return jsonify({"error": "無法下載或清理資料"}), 400
+        df = df_raw[['Open', 'High', 'Low', 'Close', 'Volume']].rename(columns={
+            'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'
+        })
+        # 移掉時區以便比較日期
+        if df.index.tz: df.index = df.index.tz_localize(None)
         
-        df['sma_5'] = df.ta.sma(length=5, close='close')
-        df['sma_20'] = df.ta.sma(length=20, close='close')
-        if df['sma_20'].isnull().all(): return jsonify({"error": "指標計算失敗"}), 400
+        df['sma_50'] = df['close'].rolling(window=50).mean()
+        df['sma_150'] = df['close'].rolling(window=150).mean()
+        df['sma_200'] = df['close'].rolling(window=200).mean()
+        df['52w_high'] = df['high'].rolling(window=252).max()
+        df['52w_low'] = df['low'].rolling(window=252).min()
+        df['sma_200_20d_ago'] = df['sma_200'].shift(20)
+        
+        if df['sma_200'].isnull().all(): return jsonify({"error": "指標計算失敗（資料不足長度）"}), 400
         
         df['signal'] = "持有"
-        yesterday_sma5, yesterday_sma20 = df['sma_5'].shift(1), df['sma_20'].shift(1)
-        buy_conditions = (df['sma_5'] > df['sma_20']) & (yesterday_sma5 < yesterday_sma20)
-        sell_conditions = (df['sma_5'] < df['sma_20']) & (yesterday_sma5 > yesterday_sma20)
-        df.loc[buy_conditions, 'signal'] = "買入"
-        df.loc[sell_conditions, 'signal'] = "賣出"
+        df['is_buy'] = False
+        
+        def is_buy_condition(row):
+            try:
+                c1 = row['close'] > row['sma_150'] and row['close'] > row['sma_200']
+                c2 = row['sma_150'] > row['sma_200']
+                c3 = row['sma_200'] > row['sma_200_20d_ago']
+                c4 = row['sma_50'] > row['sma_150']
+                c5 = row['close'] > 1.25 * row['52w_low']
+                c6 = row['close'] > 0.75 * row['52w_high']
+                return all([c1, c2, c3, c4, c5, c6])
+            except Exception:
+                return False
+
+        # Apply the buy condition row by row
+        buy_mask = df.apply(is_buy_condition, axis=1)
+        # Shift to find where it wasn't a buy yesterday but is today (new breakthrough)
+        new_buy_mask = buy_mask & (~buy_mask.shift(1).fillna(False))
+        df.loc[new_buy_mask, 'signal'] = "買入"
+        
+        # 過濾回真正要求的 start_date 到 end_date
+        df = df.loc[start_date:end_date]
         
         backtest_portfolio = {'cash': initial_cash, 'position': 0, 'avg_cost': 0}
         daily_assets, trade_log = [], []
         for index, row in df.iterrows():
             price, signal = row['close'], row['signal']
+            # 優先檢查停損
             if backtest_portfolio['position'] > 0:
                 stop_loss_price = backtest_portfolio['avg_cost'] * (1 - STOP_LOSS_PCT)
                 if price < stop_loss_price:
@@ -517,6 +553,8 @@ def handle_backtest():
                     trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '停損賣出', 'shares': backtest_portfolio['position'], 'price': price, 'total_value': price * backtest_portfolio['position'], 'profit': profit})
                     backtest_portfolio['cash'] += price * backtest_portfolio['position']
                     backtest_portfolio['position'], backtest_portfolio['avg_cost'] = 0, 0
+                    
+            # 處理買進 (注意如果剛停損賣出，不應該馬上又買進，此處因訊號通常不會同時發生尚可接受)
             if signal == "買入" and backtest_portfolio['position'] < MAX_POSITION_SHARES:
                 if backtest_portfolio['position'] == 0 or price > backtest_portfolio['avg_cost']:
                     if backtest_portfolio['cash'] >= price * ADD_ON_SHARES:
@@ -526,12 +564,9 @@ def handle_backtest():
                         backtest_portfolio['cash'] -= price * ADD_ON_SHARES
                         backtest_portfolio['avg_cost'] = new_total / backtest_portfolio['position']
                         trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '執行買入', 'shares': ADD_ON_SHARES, 'price': price, 'total_value': price * ADD_ON_SHARES, 'profit': None})
-            elif signal == "賣出" and backtest_portfolio['position'] > 0:
-                profit = (price - backtest_portfolio['avg_cost']) * backtest_portfolio['position']
-                trade_log.append({'timestamp': str(index.date()), 'stock_id': stock_id, 'action': '訊號賣出', 'shares': backtest_portfolio['position'], 'price': price, 'total_value': price * backtest_portfolio['position'], 'profit': profit})
-                backtest_portfolio['cash'] += price * backtest_portfolio['position']
-                backtest_portfolio['position'], backtest_portfolio['avg_cost'] = 0, 0
+            
             daily_assets.append(backtest_portfolio['cash'] + (backtest_portfolio['position'] * price))
+
         results = {"chart_data": {"dates": [d.strftime('%Y-%m-%d') for d in df.index],"values": daily_assets},"trades": trade_log}
         return jsonify(results)
     except Exception as e:
@@ -558,14 +593,23 @@ def update_settings_api():
         logging.error(f"更新設定 API 發生錯誤: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
+def start_scheduler():
+    scheduler = BackgroundScheduler(timezone=pytz.timezone('Asia/Taipei'))
+    # 設定週一到週五的 13:30 觸發
+    scheduler.add_job(run_trading_job, 'cron', day_of_week='mon-fri', hour=13, minute=30)
+    scheduler.start()
+    logging.info("⏰ APScheduler 背景定時任務已啟動 (排程時間: 每週一至週五 13:30)")
+
 def create_app():
     with app.app_context():
         setup_database()
+        start_scheduler() # 啟動排程
     return app
 
 if __name__ == '__main__':
     if not DATABASE_URL:
-        logging.error("❌ 錯誤：未設定 DATABASE_URL 環境變數，無法在本地啟動。")
+        logging.error("❌ 錯誤：未設定 DATABASE_URL 環境變數，無法啟動。")
     else:
         setup_database()
+        start_scheduler()
         app.run(host='0.0.0.0', port=5001, debug=True)
