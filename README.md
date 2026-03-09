@@ -4,7 +4,8 @@
 
 ## **專案預覽**
 
-<img width="1704" height="1716" alt="image" src="https://github.com/user-attachments/assets/4dfd86f8-edab-43ff-adb5-5823c4d5cdec" />
+<img width="869" height="1587" alt="image" src="https://github.com/user-attachments/assets/87b40a09-d70c-4666-ae7d-d657700da7d6" />
+
 
 
 ## **系統架構**
